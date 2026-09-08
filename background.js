@@ -6,20 +6,37 @@
 let ws = null;
 let tradingTabId = null;
 let wsUrl = 'ws://localhost:8080'; // 默认WebSocket地址，后续可以配置
+let heartbeatTimer = null; // 心跳定时器
+let heartbeatCheckTimer = null; // 心跳检查定时器
+let lastHeartbeatTime = null; // 上次收到心跳响应的时间
 
 /**
  * 连接WebSocket服务器
  */
 function connectWebSocket() {
   try {
+    // 清除旧的心跳定时器
+    clearHeartbeat();
+    
     ws = new WebSocket(wsUrl);
     
     ws.onopen = () => {
       console.log('WebSocket连接已建立');
+      // 启动心跳机制
+      startHeartbeat();
     };
     
     ws.onmessage = (event) => {
       console.log('收到WebSocket消息:', event.data);
+      
+      // 先判断是否是心跳响应（字符串 'pong'）
+      if (event.data === 'pong') {
+        lastHeartbeatTime = Date.now();
+        console.log('收到心跳响应: pong');
+        return;
+      }
+      
+      // 尝试解析JSON消息
       try {
         const message = JSON.parse(event.data);
         handleWebSocketMessage(message);
@@ -32,14 +49,95 @@ function connectWebSocket() {
       console.error('WebSocket错误:', error);
     };
     
-    ws.onclose = () => {
-      console.log('WebSocket连接已关闭，5秒后重连...');
+    ws.onclose = (event) => {
+      console.log('===== WebSocket连接已关闭 =====');
+      console.log('关闭代码:', event.code);
+      console.log('关闭原因:', event.reason || '无');
+      console.log('是否正常关闭:', event.wasClean);
+      console.log('关闭类型说明:', getCloseCodeDescription(event.code));
+      console.log('5秒后自动重连...');
+      console.log('================================');
+      
+      clearHeartbeat();
       setTimeout(connectWebSocket, 5000);
     };
   } catch (error) {
     console.error('连接WebSocket失败:', error);
+    clearHeartbeat();
     setTimeout(connectWebSocket, 5000);
   }
+}
+
+/**
+ * 启动心跳机制
+ */
+function startHeartbeat() {
+  // 初始化最后心跳时间
+  lastHeartbeatTime = Date.now();
+  
+  // 每5秒发送一次心跳
+  heartbeatTimer = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send('ping');
+      console.log('发送心跳: ping');
+    }
+  }, 5000);
+  
+  // 每5秒检查一次是否超时（30秒未收到响应）
+  heartbeatCheckTimer = setInterval(() => {
+    const now = Date.now();
+    const timeSinceLastHeartbeat = now - lastHeartbeatTime;
+    
+    if (timeSinceLastHeartbeat > 30000) {
+      console.log('心跳超时（超过30秒未响应），断开连接...');
+      if (ws) {
+        ws.close();
+      }
+    }
+  }, 5000);
+}
+
+/**
+ * 清除心跳定时器
+ */
+function clearHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+  
+  if (heartbeatCheckTimer) {
+    clearInterval(heartbeatCheckTimer);
+    heartbeatCheckTimer = null;
+  }
+  
+  lastHeartbeatTime = null;
+}
+
+/**
+ * 获取WebSocket关闭代码的描述
+ * @param {number} code - 关闭代码
+ * @returns {string} 关闭代码的描述
+ */
+function getCloseCodeDescription(code) {
+  const descriptions = {
+    1000: '正常关闭',
+    1001: '终端离开（浏览器标签页关闭或离开页面）',
+    1002: '协议错误',
+    1003: '收到不支持的数据类型',
+    1005: '未收到关闭代码（保留）',
+    1006: '连接异常关闭（没有发送关闭帧）',
+    1007: '收到的数据类型不一致',
+    1008: '收到违反政策的消息',
+    1009: '收到过大的消息',
+    1010: '客户端期望协商扩展，但服务器未响应',
+    1011: '服务器遇到意外情况',
+    1012: '服务器正在重启',
+    1013: '服务器临时过载，稍后再试',
+    1015: 'TLS握手失败（保留）'
+  };
+  
+  return descriptions[code] || `未知关闭代码: ${code}`;
 }
 
 /**
