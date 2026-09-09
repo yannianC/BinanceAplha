@@ -10,6 +10,180 @@ let heartbeatTimer = null; // 心跳定时器
 let heartbeatCheckTimer = null; // 心跳检查定时器
 let lastHeartbeatTime = null; // 上次收到心跳响应的时间
 
+// ============ 持有资产查询（cloud-wallet/alpha）============
+// 资产接口地址
+const ALPHA_ASSETS_URL = 'https://www.binance.com/bapi/defi/v1/private/wallet-direct/cloud-wallet/alpha';
+// 捕获到的请求头（内存缓存，随 service worker 休眠清空，所以同时存 storage）
+let alphaHeadersCache = null;
+
+/**
+ * 重放时不能手动设置的头（浏览器自动管理或 fetch 禁止）
+ */
+const REPLAY_HEADER_BLOCKLIST = new Set([
+  'cookie', 'host', 'connection', 'content-length', 'origin', 'referer',
+  'accept-encoding', 'user-agent', 'priority',
+  'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-user',
+  'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform'
+]);
+
+/**
+ * 把捕获的请求头过滤成可重放的头
+ */
+function buildReplayHeaders(captured) {
+  const out = {};
+  if (!captured) return out;
+  Object.keys(captured).forEach((name) => {
+    const lower = name.toLowerCase();
+    if (REPLAY_HEADER_BLOCKLIST.has(lower)) return;
+    if (lower.startsWith('sec-')) return;
+    out[name] = captured[name];
+  });
+  return out;
+}
+
+/**
+ * 保存捕获到的请求头（内存 + storage）
+ */
+function saveAlphaHeaders(record) {
+  alphaHeadersCache = record;
+  try {
+    chrome.storage.local.set({ alphaHeaders: record });
+  } catch (e) {
+    console.warn('保存请求头到storage失败:', e);
+  }
+}
+
+/**
+ * 读取捕获到的请求头（先内存后storage）
+ */
+async function loadAlphaHeaders() {
+  if (alphaHeadersCache && alphaHeadersCache.headers) return alphaHeadersCache;
+  try {
+    const result = await chrome.storage.local.get(['alphaHeaders']);
+    if (result.alphaHeaders && result.alphaHeaders.headers) {
+      alphaHeadersCache = result.alphaHeaders;
+      return alphaHeadersCache;
+    }
+  } catch (e) {
+    console.warn('读取storage中的请求头失败:', e);
+  }
+  return null;
+}
+
+/**
+ * 重放资产查询请求，获取持有资产
+ * 返回 { ok, status, data }
+ */
+async function refreshAssets() {
+  const record = await loadAlphaHeaders();
+
+  if (!record || !record.headers || Object.keys(record.headers).length === 0) {
+    return {
+      ok: false,
+      status: 0,
+      data: {
+        code: 'NO_HEADERS',
+        message: '尚未捕获到资产接口请求头，请先打开/刷新币安Alpha页面，让页面自己发一次该请求'
+      }
+    };
+  }
+
+  const replayHeaders = buildReplayHeaders(record.headers);
+  console.log(`重放资产查询，使用 ${Object.keys(replayHeaders).length} 个头（捕获于 ${new Date(record.at || 0).toLocaleTimeString()}）`);
+
+  try {
+    const response = await fetch(ALPHA_ASSETS_URL, {
+      method: record.method && record.method !== 'GET' ? record.method : 'GET',
+      credentials: 'include',  // 自动携带登录cookie
+      headers: replayHeaders
+    });
+
+    const text = await response.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      data = { code: 'PARSE_ERROR', message: '响应不是JSON', raw: text.slice(0, 500) };
+    }
+
+    return { ok: response.ok, status: response.status, data: data };
+  } catch (error) {
+    console.error('重放资产查询失败:', error);
+    return {
+      ok: false,
+      status: 0,
+      data: { code: 'REPLAY_ERROR', message: error.message }
+    };
+  }
+}
+
+/**
+ * 通过 WebSocket 上报资产结果
+ */
+function sendAssetsResult(assetsData, unionId, bnResp) {
+  const response = {
+    type: 'assetsResult',
+    data: {
+      assetsData: assetsData,
+      unionId: unionId,
+      bnResp: bnResp  // 0=插件自己构建的错误，1=币安返回
+    }
+  };
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(response));
+    console.log('已发送资产结果到WebSocket, unionId:', unionId);
+    return true;
+  } else {
+    console.warn('WebSocket未连接，资产结果未发送');
+    return false;
+  }
+}
+
+/**
+ * 处理刷新资产请求（来自WS或popup测试）
+ */
+async function handleRefreshAssets(unionId) {
+  const result = await refreshAssets();
+  if (result.ok) {
+    sendAssetsResult(result.data, unionId, 1);
+  } else {
+    sendAssetsResult(result.data, unionId, 0);
+  }
+  return result;
+}
+
+/**
+ * webRequest 兜底捕获：能拿到完整真实请求头（含cookie），作为 injected.js 捕获的备份
+ */
+try {
+  chrome.webRequest.onBeforeSendHeaders.addListener(
+    (details) => {
+      try {
+        const headers = {};
+        (details.requestHeaders || []).forEach((h) => {
+          headers[h.name] = h.value;
+        });
+        if (Object.keys(headers).length > 0) {
+          saveAlphaHeaders({
+            url: details.url,
+            method: details.method,
+            headers: headers,
+            at: Date.now(),
+            source: 'webRequest'
+          });
+          console.log('webRequest兜底捕获到资产接口请求头，字段数:', Object.keys(headers).length);
+        }
+      } catch (e) {}
+    },
+    { urls: ['https://www.binance.com/bapi/defi/v1/private/wallet-direct/cloud-wallet/alpha*'] },
+    ['requestHeaders']
+  );
+  console.log('webRequest兜底捕获已注册');
+} catch (e) {
+  console.warn('注册webRequest捕获失败:', e);
+}
+
 /**
  * 连接WebSocket服务器
  */
@@ -17,25 +191,52 @@ function connectWebSocket() {
   try {
     // 清除旧的心跳定时器
     clearHeartbeat();
-    
-    ws = new WebSocket(wsUrl);
-    
-    ws.onopen = () => {
+
+    // 关闭旧连接：先摘掉回调，防止旧连接的事件误杀新连接心跳、或安排多余的重连
+    if (ws) {
+      try {
+        const old = ws;
+        old.onopen = null;
+        old.onmessage = null;
+        old.onerror = null;
+        old.onclose = null;
+        old.close();
+      } catch (e) {}
+      ws = null;
+    }
+
+    // 用局部变量持有本次连接，事件触发时校验身份，陈旧连接的事件一律忽略
+    const sock = new WebSocket(wsUrl);
+    ws = sock;
+
+    sock.onopen = () => {
+      if (sock !== ws) return;
       console.log('WebSocket连接已建立');
       // 启动心跳机制
       startHeartbeat();
+      // 连接建立后，如已捕获到请求头，主动查询并上报一次持有资产
+      loadAlphaHeaders().then((record) => {
+        if (sock !== ws) return;
+        if (record && record.headers && Object.keys(record.headers).length > 0) {
+          console.log('连接建立，主动刷新一次持有资产...');
+          handleRefreshAssets('startup');
+        } else {
+          console.log('尚无捕获的请求头，跳过启动资产刷新（打开币安Alpha页面后会自动捕获）');
+        }
+      });
     };
-    
-    ws.onmessage = (event) => {
+
+    sock.onmessage = (event) => {
+      if (sock !== ws) return;
       console.log('收到WebSocket消息:', event.data);
-      
+
       // 先判断是否是心跳响应（字符串 'pong'）
       if (event.data === 'pong') {
         lastHeartbeatTime = Date.now();
         console.log('收到心跳响应: pong');
         return;
       }
-      
+
       // 尝试解析JSON消息
       try {
         const message = JSON.parse(event.data);
@@ -44,12 +245,14 @@ function connectWebSocket() {
         console.error('解析WebSocket消息失败:', error);
       }
     };
-    
-    ws.onerror = (error) => {
+
+    sock.onerror = (error) => {
+      if (sock !== ws) return;
       console.error('WebSocket错误:', error);
     };
-    
-    ws.onclose = (event) => {
+
+    sock.onclose = (event) => {
+      if (sock !== ws) return; // 陈旧连接关闭：不杀新连接心跳，也不安排重连
       console.log('===== WebSocket连接已关闭 =====');
       console.log('关闭代码:', event.code);
       console.log('关闭原因:', event.reason || '无');
@@ -57,7 +260,7 @@ function connectWebSocket() {
       console.log('关闭类型说明:', getCloseCodeDescription(event.code));
       console.log('5秒后自动重连...');
       console.log('================================');
-      
+
       clearHeartbeat();
       setTimeout(connectWebSocket, 5000);
     };
@@ -72,6 +275,9 @@ function connectWebSocket() {
  * 启动心跳机制
  */
 function startHeartbeat() {
+  // 幂等：先清掉可能残留的旧定时器，防止叠加
+  clearHeartbeat();
+
   // 初始化最后心跳时间
   lastHeartbeatTime = Date.now();
   
@@ -158,6 +364,15 @@ function handleWebSocketMessage(message) {
   //   }
   // }
   
+  // 刷新持有资产指令:
+  // { "type": "refreshAssets", "data": { "unionId": "xxxxxxxx" } }
+  if (message.type === 'refreshAssets') {
+    const unionId = (message.data && message.data.unionId) || '';
+    console.log('收到刷新资产指令, unionId:', unionId);
+    handleRefreshAssets(unionId);
+    return;
+  }
+
   if (message.type === 'order' && message.data) {
     const { chainName, address, amt, symbol, price, unionId } = message.data;
     
@@ -395,6 +610,39 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     
     sendResponse({ success: true });
+  } else if (request.action === 'alphaHeadersCaptured') {
+    // content.js 转发来的资产接口请求头（injected.js 捕获）
+    saveAlphaHeaders({
+      url: request.data.url,
+      method: request.data.method,
+      headers: request.data.headers,
+      at: request.data.at || Date.now(),
+      source: 'injected'
+    });
+    console.log('已保存injected捕获的请求头，字段数:', Object.keys(request.data.headers || {}).length);
+    sendResponse({ success: true });
+  } else if (request.action === 'refreshAssetsTest') {
+    // popup 测试按钮：重放资产查询
+    handleRefreshAssets('popup-test').then((result) => {
+      sendResponse({ success: result.ok, status: result.status, data: result.data });
+    });
+    return true; // 异步响应
+  } else if (request.action === 'getCapturedHeadersInfo') {
+    // popup 查询捕获状态（只回字段名和时间，不回值）
+    loadAlphaHeaders().then((record) => {
+      if (record && record.headers) {
+        sendResponse({
+          captured: true,
+          url: record.url,
+          at: record.at,
+          source: record.source,
+          headerNames: Object.keys(record.headers)
+        });
+      } else {
+        sendResponse({ captured: false });
+      }
+    });
+    return true; // 异步响应
   } else if (request.action === 'getTabId') {
     sendResponse({ tabId: tradingTabId });
   } else if (request.action === 'connectWS') {

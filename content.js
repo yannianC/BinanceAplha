@@ -36,6 +36,30 @@ function injectInterceptorScript() {
 window.addEventListener('message', (event) => {
   if (event.source !== window) return;
   
+  if (event.data.type === 'ALPHA_HEADERS_CAPTURED') {
+    console.log('====== 捕获到私有接口请求头 ======');
+    console.log('URL:', event.data.url);
+    console.log('字段数:', Object.keys(event.data.headers || {}).length);
+    console.log('==================================');
+
+    // 转发到 background script 存储（值不出本机，仅用于重放资产查询）
+    try {
+      chrome.runtime.sendMessage({
+        action: 'alphaHeadersCaptured',
+        data: {
+          url: event.data.url,
+          method: event.data.method,
+          headers: event.data.headers,
+          at: event.data.at
+        }
+      });
+      console.log('✅ 请求头已发送到background script');
+    } catch (error) {
+      console.warn('⚠️ 转发请求头失败（可能插件已重新加载）:', error.message);
+    }
+    return;
+  }
+
   if (event.data.type === 'FETCH_RESPONSE') {
     console.log('====== 拦截到API响应 ======');
     console.log('URL:', event.data.url);

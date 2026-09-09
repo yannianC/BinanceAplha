@@ -101,6 +101,44 @@ document.addEventListener('DOMContentLoaded', () => {
       active: false 
     });
   });
+
+  /**
+   * 刷新持有资产按钮点击事件
+   */
+  const refreshAssetsBtn = document.getElementById('refreshAssetsBtn');
+  const assetsInfo = document.getElementById('assetsInfo');
+
+  refreshAssetsBtn.addEventListener('click', () => {
+    assetsInfo.textContent = '资产查询中...';
+    chrome.runtime.sendMessage({ action: 'refreshAssetsTest' }, (response) => {
+      if (!response) {
+        assetsInfo.textContent = '无响应（background未就绪）';
+        return;
+      }
+      if (response.success) {
+        const d = response.data || {};
+        const list = (d.data && Array.isArray(d.data)) ? d.data : (Array.isArray(d.data) ? d.data : null);
+        if (list) {
+          const summary = list.map(a => `${a.asset || a.tokenSymbol || a.symbol || '?'}:${a.free || a.amount || a.balance || '?'}`).join(' ');
+          assetsInfo.textContent = `✅ 成功(HTTP ${response.status}) 共${list.length}项: ${summary.slice(0, 120)}`;
+        } else {
+          assetsInfo.textContent = `✅ 成功(HTTP ${response.status}): ${JSON.stringify(d).slice(0, 150)}`;
+        }
+      } else {
+        assetsInfo.textContent = `❌ 失败(HTTP ${response.status || 0}): ${JSON.stringify(response.data).slice(0, 150)}`;
+      }
+    });
+  });
+
+  /**
+   * 打开popup时显示请求头捕获状态
+   */
+  chrome.runtime.sendMessage({ action: 'getCapturedHeadersInfo' }, (response) => {
+    if (response && response.captured) {
+      const time = response.at ? new Date(response.at).toLocaleTimeString() : '?';
+      assetsInfo.textContent = `已捕获请求头 ${response.headerNames.length} 个字段（${time}，来源:${response.source || '?'}）`;
+    }
+  });
   
   /**
    * 测试交易按钮点击事件
