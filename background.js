@@ -383,7 +383,10 @@ function handleWebSocketMessage(message) {
       // 根据amt的正负判断买卖方向
       const direction = parseFloat(amt) > 0 ? 'Buy' : 'Sell';
       const amount = Math.abs(parseFloat(amt)).toString();
-      
+
+      // 系统通知：后台运行时用户能感知到下单指令
+      notify('收到下单指令', `${direction === 'Buy' ? '买入' : '卖出'} ${amount} ${symbol} @ ${price}`);
+
       executeTrade({
         url,
         price,
@@ -608,7 +611,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       ws.send(JSON.stringify(response));
       console.log('已发送交易结果到WebSocket:', response);
     }
-    
+
+    // 系统通知下单结果
+    const od = request.data.orderData || {};
+    if (request.data.bnResp === 1) {
+      notify('下单回执', '币安已返回: ' + JSON.stringify(od).slice(0, 80));
+    } else {
+      notify('下单失败', ((od.code || '') + ' ' + (od.message || '')).slice(0, 100));
+    }
+
     sendResponse({ success: true });
   } else if (request.action === 'alphaHeadersCaptured') {
     // content.js 转发来的资产接口请求头（injected.js 捕获）
@@ -648,6 +659,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   } else if (request.action === 'connectWS') {
     if (request.url) {
       wsUrl = request.url;
+      // 保存地址，供后台自动连接使用（SW重启/浏览器重启后无需再开popup）
+      try { chrome.storage.local.set({ wsUrl: wsUrl }); } catch (e) {}
     }
     connectWebSocket();
     sendResponse({ success: true });
@@ -677,20 +690,80 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 /**
+ * 根据浏览器编号拼接WS地址
+ */
+function buildWsUrl(number) {
+  return 'wss://sg.bicoin.com.cn/98c/weborder/BINANCEALPHA-' + number;
+}
+
+/**
+ * 后台自动连接：读取保存的编号/地址，自动连上WS（无需打开popup）
+ */
+async function autoConnectFromStorage(reason) {
+  try {
+    // 已有活跃连接就不重复连
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    const stored = await chrome.storage.local.get(['browserNumber', 'wsUrl']);
+    const url = stored.wsUrl || (stored.browserNumber ? buildWsUrl(stored.browserNumber) : null);
+    if (!url) {
+      console.log(`[${reason}] 未保存浏览器编号，暂不自动连接（在popup里输入编号连接一次即可，之后全自动）`);
+      return;
+    }
+    wsUrl = url;
+    console.log(`[${reason}] 自动连接WebSocket:`, wsUrl);
+    connectWebSocket();
+  } catch (e) {
+    console.warn('自动连接失败:', e);
+  }
+}
+
+/**
+ * 系统通知（下单指令/回执提醒，后台运行时用户能感知）
+ */
+function notify(title, message) {
+  try {
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icon.png',
+      title: title,
+      message: message
+    });
+  } catch (e) {}
+}
+
+/**
  * 插件安装或更新时的处理
  */
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('币安Alpha交易助手已安装');
-  // 暂时不自动连接WebSocket，等待用户手动连接
-  // connectWebSocket();
+  console.log('币安Alpha交易助手已安装/更新');
+  autoConnectFromStorage('onInstalled');
 });
 
 /**
- * 监听插件启动
+ * 浏览器启动时的处理
  */
 chrome.runtime.onStartup.addListener(() => {
-  console.log('币安Alpha交易助手已启动');
-  // 暂时不自动连接WebSocket
-  // connectWebSocket();
+  console.log('币安Alpha交易助手已随浏览器启动');
+  autoConnectFromStorage('onStartup');
 });
+
+/**
+ * 看门狗：每30秒检查一次WS，断了自动重连
+ * （service worker 被休眠唤醒时也靠它兜底恢复连接）
+ */
+chrome.alarms.create('ws-watchdog', { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== 'ws-watchdog') return;
+  if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+    console.log('看门狗检测到WS未连接，尝试自动重连...');
+    autoConnectFromStorage('watchdog');
+  }
+});
+
+/**
+ * Service Worker 每次被唤醒/启动时，也尝试自动连接
+ */
+autoConnectFromStorage('sw-start');
 
