@@ -1,6 +1,6 @@
 /* Bounded per-extension diagnostics. Never store raw messages, headers or credentials. */
 (function(root){
-  const allowed=new Set('unionId attemptId instanceNumber version chainName address price amt amount direction coin symbol tabId windowId stage code message error reason bnResp healthy canTrade isreadySent refreshed checkedAt type expected preparationErrors attempt at formCheck id actual exists disabled readOnly visible stableChecks elapsedMs beforeSubmit after values limitPrice limitAmount limitTotal balanceHints pageDiagnostics orderData'.split(' '));
+  const allowed=new Set('unionId attemptId instanceNumber version chainName address price amt amount direction coin symbol tabId windowId stage code message error reason bnResp healthy canTrade isreadySent refreshed checkedAt type expected preparationErrors attempt at formCheck id actual exists disabled readOnly visible stableChecks elapsedMs beforeSubmit after values limitPrice limitAmount limitTotal balanceHints pageDiagnostics orderData historyCheck queried matched candidates orderId side origQty executedQty status time updateTime'.split(' '));
   function clean(value,depth=0){
     if(depth>8)return undefined;
     if(typeof value==='string')return value.replace(/(?:authorization|cookie|csrftoken|password|secret|token)\s*[:=]\s*[^\n]*/gi,'[REDACTED]').replace(/Bearer\s+\S+/gi,'Bearer [REDACTED]').slice(0,800);

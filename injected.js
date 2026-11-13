@@ -16,7 +16,16 @@
 
   // ============ 目标接口 ============
   const ORDER_PLACE_PATH = '/bapi/asset/v1/private/alpha-trade/order/place';
+  const HISTORY_PATH='/bapi/defi/v1/private/alpha-trade/order/get-order-history-merge';
   let armedOrder = null;
+  function captureOrderRequest(id,body,responseToken) {
+    if(!id || typeof body!=='string')return;
+    try {
+      const raw=JSON.parse(body),data={};
+      for(const key of ['symbol','side','price','quantity'])if(typeof raw[key]==='string' && raw[key].length<=100)data[key]=raw[key];
+      post({type:'ALPHA_ORDER_REQUEST',unionId:id,data},responseToken);
+    } catch(_) {}
+  }
   window.addEventListener('message', event => {
     if (event.source !== window || !event.data || event.data.instanceId !== instanceId) return;
     if(event.data.type==='ALPHA_ENABLE') {if(token!==event.data.token)armedOrder=null;token=event.data.token;return;}
@@ -112,6 +121,10 @@
 
     const orderId = takeOrderId(url);
     const responseToken=token;
+    if(orderId) {
+      if(typeof init.body==='string')captureOrderRequest(orderId,init.body,responseToken);
+      else if(req && typeof req.clone==='function')req.clone().text().then(body=>captureOrderRequest(orderId,body,responseToken)).catch(()=>{});
+    }
     return originalFetch.apply(this, args).then(response => {
       // 克隆response以便我们可以读取它
       const clonedResponse = response.clone();
@@ -131,6 +144,8 @@
         }).catch(err => {
           console.error('解析Fetch响应失败:', err);
         });
+      } else if(url.includes(HISTORY_PATH)) {
+        clonedResponse.json().then(data=>post({type:'ALPHA_ORDER_HISTORY',pageUrl,data},responseToken)).catch(()=>{});
       } else if (shouldCaptureHeaders(url)) {
         // 资产接口：捕获响应体（币安前端交易后自动刷新资产时被动拿到最新数据）
         clonedResponse.json().then(data => {
@@ -182,6 +197,10 @@
     const orderId = takeOrderId(this._url || "");
     const responseToken=token;
     const pageUrl = location.href;
+    captureOrderRequest(orderId,args[0],responseToken);
+    if((this._url || '').includes(HISTORY_PATH))this.addEventListener('load',function(){
+      try {post({type:'ALPHA_ORDER_HISTORY',pageUrl,data:JSON.parse(this.responseText)},responseToken);}catch(_) {}
+    });
     // 捕获请求头 + 响应体（资产接口）
     if (this._url && shouldCaptureHeaders(this._url)) {
       try {

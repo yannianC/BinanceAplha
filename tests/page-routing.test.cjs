@@ -11,11 +11,11 @@ function routing(tabs) {
   query:async q=>tabs.filter(t=>t.windowId===q.windowId),create:async t=>{const tab={...t,id:tabs.length+1,status:'complete'};tabs.push(tab);created.push(tab);return tab},
   get:async id=>{const tab=tabs.find(t=>t.id===id);if(!tab)throw Error('closed');return tab},
   update:async(id,values)=>{const tab=tabs.find(t=>t.id===id);Object.assign(tab,values);return tab},
-  sendMessage:async(id,msg)=>msg.action==='activatePage'?{protocol:7,authorized:true}:(sent.push({id,msg}),{protocol:7,data:{unionId:msg.data.unionId,bnResp:1,orderData:{code:'000000'}}})
+  sendMessage:async(id,msg)=>msg.action==='activatePage'?{protocol:8,authorized:true}:(sent.push({id,msg}),{protocol:8,data:{unionId:msg.data.unionId,bnResp:1,orderData:{code:'000000'}}})
  }};
  const windowBinding={require:async()=>({windowId:1,token:"t"}),authorize:async id=>{if((await chrome.tabs.get(id)).windowId!==1)throw Error("wrong window")}};
  const ctx=vm.createContext({chrome,windowBinding,AlphaTrade,console:silent,setTimeout,clearTimeout,Date,URL,crypto:require('node:crypto').webcrypto});
- vm.runInContext('function logEvent(){}let tradingTabId,activeDispatch=null;const ws=null;'+source.slice(source.indexOf('async function executeTrade(tradeInfo)'),source.indexOf('/**\n * 监听来自content script')),ctx);
+ vm.runInContext('function logEvent(){}let tradingTabId,activeDispatch=null;const ws=null;const historyReloadedTabs=new Set();'+source.slice(source.indexOf('async function executeTrade(tradeInfo)'),source.indexOf('/**\n * 监听来自content script')),ctx);
  return {ctx,sent,created};
 }
 test('A B A reuses pages across locales, creates missing B without closing A',async()=>{
@@ -252,4 +252,55 @@ for(const recovers of [true,false])test(`real price mismatch ${recovers?'recover
  const result=await ctx.executeTradeOnPage({bindingToken:'t',url:ctx.location.href,unionId:'sync',price:'0.05040560',amount:'15535',direction:'Buy',coin:'AAA',deadline:Date.now()+80000});
  assert.equal(fills,4);assert.equal(clicks,recovers?1:0);assert.equal(result.orderData.code,recovers?'000000':'EXECUTION_ERROR');
  if(!recovers){const d=result.orderData.pageDiagnostics;assert.equal(d.expected.price,'0.05040560');assert.equal(d.preparationErrors.length,2);assert.equal(d.preparationErrors[0].formCheck.actual,'0.05');}
+});
+
+
+test('confirmed order waits exactly ten seconds then requests history recovery without resubmitting',async()=>{
+ const {ctx}=pageFixture();let now=10000,submits=0;
+ ctx.Date=class extends Date{static now(){return now}};ctx.sleep=async ms=>{now+=ms};
+ ctx.clickSubmitButton=async(_,__,before)=>{before();submits++};
+ ctx.clickDialogConfirmButton=async t=>{t.confirmedAt=now};
+ const r=await ctx.executeTradeOnPage({bindingToken:'t',url:ctx.location.href,unionId:'timeout',deadline:90000});
+ assert.equal(r.recoverHistory,true);assert.equal(r.confirmedAt,10100);assert.equal(now,20100);
+ assert.equal(r.bnResp,0);assert.equal(submits,1);
+});
+
+test('receipt within ten seconds returns normally and never requests history recovery',async()=>{
+ const {ctx,emit}=pageFixture();let now=10000;
+ ctx.Date=class extends Date{static now(){return now}};
+ ctx.sleep=async ms=>{now+=ms;if(now>=15000)emit({type:'FETCH_RESPONSE',unionId:'receipt',data:{code:'000000'}})};
+ ctx.clickSubmitButton=async(_,__,before)=>before();ctx.clickDialogConfirmButton=async t=>{t.confirmedAt=now};
+ const r=await ctx.executeTradeOnPage({bindingToken:'t',url:ctx.location.href,unionId:'receipt',deadline:90000});
+ assert.equal(r.orderData.code,'000000');assert.equal(r.recoverHistory,undefined);assert.equal(now,15000);
+});
+
+test('history read clicks only history navigation, captures response and restores open orders',async()=>{
+ const {ctx,emit}=pageFixture();let now=10000;const clicks=[];
+ ctx.Date=class extends Date{static now(){return now}};ctx.sleep=async ms=>{now+=ms};
+ const open={textContent:'当前委托',offsetParent:{},isConnected:true,click(){clicks.push('open')}};
+ const history={textContent:'历史委托',offsetParent:{},getAttribute:()=>null,click(){clicks.push('history');emit({type:'ALPHA_ORDER_HISTORY',pageUrl:ctx.location.href,data:{code:'000000',data:[{orderId:'sample',status:'FILLED'}]}})}};
+ ctx.document={querySelectorAll:()=>[open,history]};
+ const r=await ctx.readOrderHistory({bindingToken:'t',url:ctx.location.href});
+ assert.equal(r.data[0].orderId,'sample');assert.deepEqual(clicks,['history','open']);
+});
+test('history read accepts a current-page response already emitted during reload without extra clicks',async()=>{
+ const {ctx,emit}=pageFixture();ctx.document={querySelectorAll(){throw Error('should not click')}};
+ emit({type:'ALPHA_ORDER_HISTORY',pageUrl:ctx.location.href,data:{code:'000000',data:[]}});
+ const r=await ctx.readOrderHistory({bindingToken:'t',url:ctx.location.href});assert.equal(r.data.length,0);
+});
+test('history read ignores a different coin response and reports a bounded timeout',async()=>{
+ const {ctx,emit}=pageFixture();let now=0;ctx.Date=class extends Date{static now(){return now}};ctx.sleep=async ms=>{now+=ms};ctx.document={querySelectorAll:()=>[]};
+ emit({type:'ALPHA_ORDER_HISTORY',pageUrl:'https://www.binance.com/en/alpha/bsc/0xbbb',data:{code:'000000',data:[]}});
+ await assert.rejects(ctx.readOrderHistory({bindingToken:'t',url:ctx.location.href}),/未找到/);assert.equal(now,12000);
+});
+test('fetch history hook preserves source page; order metadata excludes credentials',async()=>{
+ const listeners=[],messages=[];const window={addEventListener:(_,f)=>listeners.push(f),postMessage:m=>messages.push(m),fetch:async()=>({clone:()=>({json:async()=>({code:'000000',data:[]})})})};
+ function xhr(){}xhr.prototype.open=function(){};xhr.prototype.setRequestHeader=function(){};xhr.prototype.send=function(){};
+ const location={href:'https://www.binance.com/en/alpha/bsc/0xaaa'};
+ const ctx=vm.createContext({window,location,document:{currentScript:{dataset:{alphaInstance:'a',alphaToken:'t'}}},XMLHttpRequest:xhr,console:silent});vm.runInContext(fs.readFileSync('injected.js','utf8'),ctx);
+ listeners.forEach(f=>f({source:window,data:{type:'ALPHA_ARM_ORDER',unionId:'attempt',instanceId:'a',token:'t'}}));
+ await window.fetch('/bapi/asset/v1/private/alpha-trade/order/place',{body:JSON.stringify({symbol:'ALPHA_772USDT',side:'BUY',price:'1',quantity:'2',csrftoken:'secret',headers:{cookie:'secret'}})});
+ const p=window.fetch('/bapi/defi/v1/private/alpha-trade/order/get-order-history-merge?page=1');location.href='https://www.binance.com/en/alpha/bsc/0xbbb';await p;await new Promise(r=>setImmediate(r));
+ assert.deepEqual(structuredClone(messages.find(m=>m.type==='ALPHA_ORDER_REQUEST').data),{symbol:'ALPHA_772USDT',side:'BUY',price:'1',quantity:'2'});
+ assert.equal(messages.find(m=>m.type==='ALPHA_ORDER_HISTORY').pageUrl,'https://www.binance.com/en/alpha/bsc/0xaaa');
 });

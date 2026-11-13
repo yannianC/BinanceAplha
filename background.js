@@ -31,6 +31,8 @@ function logEvent(event,data={}) {
   try {void localLog.append(event,{...data,instanceNumber,version:chrome.runtime.getManifest?.().version || ''});}catch(_){}
 }
 let activeDispatch=null;
+const historyReloadedTabs=new Set();
+chrome.tabs.onRemoved.addListener(tabId=>historyReloadedTabs.delete(tabId));
 let maintenance = false;
 let acceptingOrders = 0;
 async function authorizeSender(sender, token) {
@@ -561,33 +563,38 @@ async function handlePageCommand(message, expected = null) {
   return result;
 }
 async function waitForReadyPage(tabId,url,token,socket,allowRecovery) {
-  let deadline=Date.now()+30000,recovered=false,lastError=Error('交易表单尚未加载');
+  let lastError=Error('交易表单尚未加载');
   async function validateContext() {
     if(ws!==socket || socket?.readyState!==WebSocket.OPEN)throw Error('WebSocket连接已变化或断开');
     await windowBinding.authorize(tabId,token);
     const current=await chrome.tabs.get(tabId);
     if(AlphaTrade.assetKey(current.pendingUrl || current.url)!==AlphaTrade.assetKey(url))throw Error('目标币种页已变化');
   }
-  for(let attempt=0;attempt<120 && Date.now()<deadline;attempt++) {
-    await validateContext();
-    try {await withTimeout(ensureContentScriptLoaded(tabId),3000);}
-    catch(e) {
-      lastError=e;
-      if(allowRecovery && !recovered) {
-        recovered=true;await validateContext();await reloadBoundTab(tabId,token);deadline=Date.now()+30000;
-        continue;
-      }
-      await sleep(250);continue;
+  for(let round=0;round<(allowRecovery?2:1);round++) {
+    if(round) {
+      await validateContext();
+      logEvent('ready_recovery_refresh',{tabId,reason:lastError.message});
+      await reloadBoundTab(tabId,token);
     }
-    let page;
-    try {page=await withTimeout(chrome.tabs.sendMessage(tabId,{action:'checkReady'}),3000);}
-    catch(e){lastError=e;await sleep(250);continue;}
-    await validateContext();
-    if(AlphaTrade.assetKey(page?.url)!==AlphaTrade.assetKey(url))throw Error('检查回执的币种不匹配');
-    if(page.healthy && page.canTrade)return page;
-    if(page.loginRequired)throw Error('币安页面需要登录');
-    lastError=Error(page.error || (page.healthy?'交易表单不可编辑或页面正在操作':'交易表单尚未加载'));
-    await sleep(250);
+    const deadline=Date.now()+30000;
+    for(let attempt=0;attempt<120 && Date.now()<deadline;attempt++) {
+      await validateContext();
+      try {await withTimeout(ensureContentScriptLoaded(tabId),3000);}
+      catch(e) {
+        lastError=e;
+        if(allowRecovery && round===0)break;
+        await sleep(250);continue;
+      }
+      let page;
+      try {page=await withTimeout(chrome.tabs.sendMessage(tabId,{action:'checkReady'}),3000);}
+      catch(e){lastError=e;await sleep(250);continue;}
+      await validateContext();
+      if(AlphaTrade.assetKey(page?.url)!==AlphaTrade.assetKey(url))throw Error('检查回执的币种不匹配');
+      if(page.healthy && page.canTrade)return page;
+      lastError=Error(page.loginRequired?'币安页面需要登录':page.error || (page.healthy?'交易表单不可编辑或页面正在操作':'交易表单尚未加载'));
+      if(page.loginRequired)break;
+      await sleep(250);
+    }
   }
   throw lastError;
 }
@@ -657,6 +664,7 @@ async function executeTrade(tradeInfo) {
   const dispatch={unionId:tradeInfo.unionId,socket:ws,token:tradeInfo.bindingToken,url:tradeInfo.url,attemptId:crypto.randomUUID(),sent:false,tabId:null};
   logEvent('order_start',{unionId:tradeInfo.unionId,attemptId:dispatch.attemptId,price:tradeInfo.price,amount:tradeInfo.amount,direction:tradeInfo.direction,coin:tradeInfo.coin});
   let dispatched = false;
+  const historyTimeout=new Promise(resolve=>{dispatch.onHistoryTimeout=resolve;});
   try {
     const binding = await windowBinding.require();
     if (binding.token !== tradeInfo.bindingToken) throw Error('订单所属窗口绑定已变化，请重新检查');
@@ -679,18 +687,66 @@ async function executeTrade(tradeInfo) {
       await waitForReadyPage(tabId,tradeInfo.url,tradeInfo.bindingToken,dispatch.socket,false);
       logEvent('page_recovery_complete',{unionId:tradeInfo.unionId,attemptId:dispatch.attemptId,tabId});
     }
+    if(historyReloadedTabs.has(tabId)) {
+      await waitForReadyPage(tabId,tradeInfo.url,tradeInfo.bindingToken,dispatch.socket,false);
+      historyReloadedTabs.delete(tabId);
+    }
     const current = await chrome.tabs.get(tabId);
     if (AlphaTrade.assetKey(current.url) !== AlphaTrade.assetKey(tradeInfo.url)) throw Error('标签页已切换到其他币种');
     await windowBinding.authorize(tabId,tradeInfo.bindingToken);
     dispatch.tabId=tabId;activeDispatch=dispatch;
     logEvent('order_dispatch',{unionId:tradeInfo.unionId,attemptId:dispatch.attemptId,tabId});
     dispatched = true;
-    const result = await withTimeout(chrome.tabs.sendMessage(tabId, {action:'executeTrade',data:{...tradeInfo, attemptId:dispatch.attemptId, deadline:Date.now()+80000}}), 90000);
-    if (!result || result.protocol !== 7 || !result.data) throw Error('页面返回了旧版或无效回执');
+    const result = await withTimeout(Promise.race([chrome.tabs.sendMessage(tabId, {action:'executeTrade',data:{...tradeInfo, attemptId:dispatch.attemptId, deadline:Date.now()+80000}}),historyTimeout]),90000);
+    if (!result || result.protocol !== 8 || !result.data) throw Error('页面返回了旧版或无效回执');
+    if(result.data.recoverHistory) {
+      if(dispatch.confirmedAt==null && Number.isFinite(result.data.confirmedAt))dispatch.confirmedAt=Math.min(Date.now(),result.data.confirmedAt);
+      if(dispatch.confirmedAt!=null)return await recoverOrderHistory(dispatch,tradeInfo,result.data);
+      throw Error('未能确认最终确认按钮的点击，不能自动恢复');
+    }
     return result.data;
   } catch (e) {
+    if(dispatched && dispatch.confirmedAt!=null && !dispatch.recoveryStarted)return await recoverOrderHistory(dispatch,tradeInfo,AlphaTrade.failure(tradeInfo.unionId,'ORDER_STATUS_UNKNOWN',e.message));
     return AlphaTrade.failure(tradeInfo.unionId, dispatched ? 'ORDER_STATUS_UNKNOWN' : 'PAGE_NOT_READY', e.message);
-  } finally {if(activeDispatch===dispatch)activeDispatch=null;}
+  } finally {clearTimeout(dispatch.historyTimer);if(activeDispatch===dispatch)activeDispatch=null;}
+}
+
+async function recoverOrderHistory(dispatch,tradeInfo,prior) {
+  dispatch.recoveryStarted=true;clearTimeout(dispatch.historyTimer);
+  const result={unionId:tradeInfo.unionId,bnResp:0,orderData:{...prior.orderData,code:'ORDER_STATUS_UNKNOWN',message:'确认后未收到下单回执，刷新查询历史；历史记录不能仅凭相似金额确认为本单'}};
+  const validate=async()=>{
+    if(activeDispatch!==dispatch || ws!==dispatch.socket || ws?.readyState!==WebSocket.OPEN)throw Error('查询历史时连接已变化');
+    await windowBinding.authorize(dispatch.tabId,dispatch.token);
+    const tab=await chrome.tabs.get(dispatch.tabId);
+    if(AlphaTrade.assetKey(tab.pendingUrl || tab.url)!==AlphaTrade.assetKey(dispatch.url))throw Error('查询历史时币种已变化');
+  };
+  try {
+    await sleep(Math.max(0,dispatch.confirmedAt+10000-Date.now()));
+    await validate();
+    logEvent('order_history_recovery_start',{unionId:dispatch.unionId,attemptId:dispatch.attemptId,tabId:dispatch.tabId});
+    historyReloadedTabs.add(dispatch.tabId);
+    await reloadBoundTab(dispatch.tabId,dispatch.token);
+    await validate();
+    // History can still be queried if the wallet-assets request is unhealthy.
+    const activationDeadline=Date.now()+10000;
+    for(;;) {
+      await validate();
+      try {await withTimeout(ensureContentScriptLoaded(dispatch.tabId),3000);break;}
+      catch(e) {if(Date.now()>=activationDeadline)throw e;await sleep(250);}
+    }
+    await validate();
+    const reply=await withTimeout(chrome.tabs.sendMessage(dispatch.tabId,{action:'readOrderHistory',data:{bindingToken:dispatch.token,url:dispatch.url}}),15000);
+    await validate();
+    if(reply?.protocol!==8 || !reply.history || reply.history.code!=='000000' || !Array.isArray(reply.history.data))throw Error(reply?.error || '历史委托返回无效');
+    const request=prior.request || dispatch.request || {};
+    // Price/time/quantity are evidence only: separate copies can place identical orders.
+    const candidates=reply.history.data.filter(row=>request.symbol && row.symbol===request.symbol && row.side===request.side && Number.isFinite(row.time) && row.time>=dispatch.confirmedAt-5000 && row.time<=Date.now()).slice(0,10).map(row=>Object.fromEntries(['orderId','symbol','side','price','origQty','executedQty','status','time','updateTime'].map(k=>[k,row[k]])));
+    result.orderData.historyCheck={queried:true,checkedAt:Date.now(),matched:false,reason:request.symbol?'NO_UNIQUE_ORDER_ID':'NO_REQUEST_IDENTITY',candidates};
+  } catch(e) {
+    result.orderData.historyCheck={queried:false,checkedAt:Date.now(),matched:false,error:e.message};
+  }
+  logEvent('order_history_recovery_result',{unionId:dispatch.unionId,attemptId:dispatch.attemptId,tabId:dispatch.tabId,...result.orderData});
+  return result;
 }
 
 async function announceConfirmedOrder(request,sender) {
@@ -700,6 +756,8 @@ async function announceConfirmedOrder(request,sender) {
   const tab=await chrome.tabs.get(dispatch.tabId);
   if(AlphaTrade.assetKey(sender.url)!==AlphaTrade.assetKey(dispatch.url) || AlphaTrade.assetKey(tab.pendingUrl || tab.url)!==AlphaTrade.assetKey(dispatch.url))return {sent:false};
   if(activeDispatch!==dispatch || dispatch.sent || ws!==dispatch.socket || ws?.readyState!==WebSocket.OPEN)return {sent:false};
+  dispatch.confirmedAt=Date.now();
+  dispatch.historyTimer=setTimeout(()=>dispatch.onHistoryTimeout({protocol:8,data:{...AlphaTrade.failure(dispatch.unionId,'ORDER_STATUS_UNKNOWN','确认后10秒无回执'),recoverHistory:true}}),10000);
   // This acknowledges a confirmation click, not exchange acceptance. The queue still serializes orders.
   dispatch.socket.send(JSON.stringify({type:'isready'}));dispatch.sent=true;
   logEvent('isready_sent',{unionId:dispatch.unionId,attemptId:dispatch.attemptId,tabId:dispatch.tabId,stage:'confirmation_clicked'});
@@ -741,7 +799,7 @@ function sleep(ms) {
  */
 async function ensureContentScriptLoaded(tabId) {
   const reply = await chrome.tabs.sendMessage(tabId, {action:'activatePage'});
-  if (reply?.protocol !== 7) {
+  if (reply?.protocol !== 8) {
     const error=Error('请刷新币安标签页以加载新版插件');error.code='CONTENT_PROTOCOL_MISMATCH';throw error;
   }
   if(!reply.authorized)throw Error(reply.error || '当前页面未绑定本插件');
@@ -802,6 +860,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       if(activeDispatch!==dispatch)throw Error('日志订单已结束');
       if(!['form_retry','form_ready','submit_clicked','confirmation_clicked'].includes(request.stage))throw Error('无效日志步骤');
       logEvent('page_step',{...request.details,stage:request.stage,unionId:dispatch.unionId,attemptId:dispatch.attemptId,tabId:dispatch.tabId,at:request.at});
+      return {success:true};
+    })().then(sendResponse).catch(e=>sendResponse({error:e.message}));return true;
+  }
+  if(request.action==='orderRequestObserved') {
+    (async()=>{
+      const dispatch=activeDispatch;
+      if(!dispatch || request.attemptId!==dispatch.attemptId || request.token!==dispatch.token || sender.tab?.id!==dispatch.tabId)throw Error('订单请求已失效');
+      await authorizeSender(sender,dispatch.token);
+      if(activeDispatch!==dispatch || AlphaTrade.assetKey(sender.url)!==AlphaTrade.assetKey(dispatch.url))throw Error('订单请求页面已变化');
+      dispatch.request=Object.fromEntries(['symbol','side','price','quantity'].filter(k=>typeof request.data?.[k]==='string' && request.data[k].length<=100).map(k=>[k,request.data[k]]));
       return {success:true};
     })().then(sendResponse).catch(e=>sendResponse({error:e.message}));return true;
   }

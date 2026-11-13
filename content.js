@@ -5,6 +5,7 @@
 
 // 存储当前交易的unionId
 let activeTrade = null;
+let historySnapshot = null;
 
 console.log('币安Alpha交易助手 - Content Script已加载');
 
@@ -38,7 +39,7 @@ async function activatePage() {
   });
   await injectionPromise;
   bridgePost({type:'ALPHA_ENABLE'});
-  return {protocol:7,authorized:true};
+  return {protocol:8,authorized:true};
 }
 // Unbound copies remain inert and do not install page-world interceptors.
 activatePage().catch(()=>{});
@@ -110,6 +111,17 @@ window.addEventListener('message', (event) => {
     return;
   }
 
+  if(event.data.type==='ALPHA_ORDER_REQUEST' && activeTrade && event.data.unionId===activeTrade.id) {
+    activeTrade.request=event.data.data;
+    try {void chrome.runtime.sendMessage({action:'orderRequestObserved',token:activeTrade.token,attemptId:activeTrade.id,data:activeTrade.request}).catch(()=>{});}catch(_) {}
+  }
+  if(event.data.type==='ALPHA_ORDER_HISTORY') {
+    try {
+      if(AlphaTrade.assetKey(event.data.pageUrl)===AlphaTrade.assetKey(location.href))
+        historySnapshot={token:pageBinding,pageUrl:event.data.pageUrl,at:Date.now(),data:event.data.data};
+    } catch(_) {}
+  }
+
   if (event.data.type === 'ALPHA_ORDER_ARMED' && activeTrade && event.data.unionId === activeTrade.id) {
     activeTrade.armed = true;
   }
@@ -123,18 +135,21 @@ window.addEventListener('message', (event) => {
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'activatePage') {
-    activatePage().then(sendResponse).catch(e=>sendResponse({protocol:7,authorized:false,error:e.message}));return true;
+    activatePage().then(sendResponse).catch(e=>sendResponse({protocol:8,authorized:false,error:e.message}));return true;
+  }
+  if(request.action==='readOrderHistory') {
+    readOrderHistory(request.data).then(history=>sendResponse({protocol:8,history})).catch(e=>sendResponse({protocol:8,error:e.message}));return true;
   }
   if (request.action === 'checkReady') {
     checkPageReady().then(sendResponse).catch(e=>sendResponse({healthy:false,canTrade:false,error:e.message}));return true;
   }
   if (request.action === 'ping') {
     // 响应ping消息，表示content script已就绪
-    sendResponse({ success: true, ready: true, protocol:7 });
+    sendResponse({ success: true, ready: true, protocol:8 });
     return true;
   } else if (request.action === 'executeTrade') {
     executeTradeOnPage(request.data)
-      .then(data => sendResponse({ protocol:7, data }))
+      .then(data => sendResponse({ protocol:8, data }))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true; // 保持消息通道打开
   }
@@ -193,8 +208,9 @@ async function executeTradeOnPage(tradeInfo) {
     await sleep(100);
     // A direct API response ends the dialog wait immediately.
     await clickDialogConfirmButton(trade, checkAsset);
-    const deadline = Date.now()+30000;
+    const deadline = trade.confirmedAt==null ? Date.now()+30000 : trade.confirmedAt+10000;
     while (!trade.receipt && Date.now()<deadline) await sleep(100);
+    if (!trade.receipt && trade.confirmedAt!=null) return {...attachOrderDiagnostics(AlphaTrade.failure(unionId,'ORDER_STATUS_UNKNOWN','确认后10秒未收到币安回执'),trade),recoverHistory:true,confirmedAt:trade.confirmedAt,request:trade.request};
     if (!trade.receipt) throw Error('未收到币安下单回执，请核对订单');
     return attachOrderDiagnostics(trade.receipt,trade);
   } catch (e) {
@@ -202,6 +218,37 @@ async function executeTradeOnPage(tradeInfo) {
   } finally {
     bridgePost({type:'ALPHA_DISARM_ORDER',unionId:trade.id});
     activeTrade = null;
+  }
+}
+
+// Read only: trigger the site's history tab; never construct or replay an order request.
+async function readOrderHistory({bindingToken,url}) {
+  const check=async()=>{
+    await checkPageAuthority(bindingToken);
+    if(activeTrade)throw Error('页面正在下单，不能切换历史');
+    if(AlphaTrade.assetKey(location.href)!==AlphaTrade.assetKey(url))throw Error('查询历史时币种已变化');
+  };
+  const deadline=Date.now()+12000;
+  let clicked=false,restore=null;
+  const findTab=labels=>Array.from(document.querySelectorAll('[role="tab"]')).find(e=>labels.includes((e.textContent || '').trim()) && e.offsetParent!==null);
+  try {
+    while(Date.now()<deadline) {
+      await check();
+      if(historySnapshot?.token===bindingToken && historySnapshot.pageUrl===location.href && String(historySnapshot.data?.code)==='000000' && Array.isArray(historySnapshot.data?.data))return historySnapshot.data;
+      if(!clicked) {
+        const tab=findTab(['历史委托','Order History']);
+        if(tab) {
+          restore=findTab(['当前委托','Open Orders']);
+          if(tab.getAttribute('aria-selected')==='true' && restore) {await check();restore.click();}
+          await check();tab.click();clicked=true;
+        }
+      }
+      await sleep(100);
+    }
+    throw Error(clicked?'历史委托接口未返回有效记录':'未找到历史委托页签');
+  } finally {
+    // Put the form back on open orders for the next queued command.
+    if(clicked && restore) {try {await check();if(restore.isConnected!==false)restore.click();}catch(_) {}}
   }
 }
 
@@ -463,9 +510,13 @@ async function clickDialogConfirmButton(trade, checkAsset) {
             if(btn.isConnected===false || btn.disabled || btn.offsetParent===null)throw Error('确认按钮已不可用');
           });
           if(!clicked)return false;
+          trade.confirmedAt=Date.now();
           logTradeStep(trade,'confirmation_clicked');
           // Notify immediately after the click; receipt/asset reporting remains independent.
-          try {await chrome.runtime.sendMessage({action:'orderConfirmClicked',token:trade.token,attemptId:trade.id});}
+          try {await new Promise(resolve=>{
+            const timer=setTimeout(resolve,500);
+            Promise.resolve(chrome.runtime.sendMessage({action:'orderConfirmClicked',token:trade.token,attemptId:trade.id})).catch(()=>{}).finally(()=>{clearTimeout(timer);resolve();});
+          });}
           catch(e){console.warn('确认点击就绪通知失败:',e.message);}
           return true;
         }
