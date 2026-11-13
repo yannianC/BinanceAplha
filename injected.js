@@ -91,6 +91,7 @@
     const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
     const init = args[1] || {};
     const req = (typeof args[0] === 'object') ? args[0] : null;
+    const pageUrl = location.href;
 
     // 只记录包含bapi的请求，减少日志
     if (url.includes('/bapi/')) {
@@ -136,6 +137,7 @@
           post({
             type: 'ALPHA_ASSETS_DATA',
             url: url,
+            pageUrl,
             data: data
           }, responseToken);
         }).catch(() => {});
@@ -179,6 +181,7 @@
   XMLHttpRequest.prototype.send = function(...args) {
     const orderId = takeOrderId(this._url || "");
     const responseToken=token;
+    const pageUrl = location.href;
     // 捕获请求头 + 响应体（资产接口）
     if (this._url && shouldCaptureHeaders(this._url)) {
       try {
@@ -190,6 +193,7 @@
             post({
               type: 'ALPHA_ASSETS_DATA',
               url: this._url,
+              pageUrl,
               data: data
             }, responseToken);
           } catch (e) {}

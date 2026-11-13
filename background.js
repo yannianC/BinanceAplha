@@ -566,20 +566,20 @@ async function handlePageCommand(message, expected = null) {
   return result;
 }
 async function waitForReadyPage(tabId,url,token,socket,allowRecovery) {
-  let deadline=Date.now()+15000,recovered=false,lastError=Error('交易表单尚未加载');
+  let deadline=Date.now()+30000,recovered=false,lastError=Error('交易表单尚未加载');
   async function validateContext() {
     if(ws!==socket || socket?.readyState!==WebSocket.OPEN)throw Error('WebSocket连接已变化或断开');
     await windowBinding.authorize(tabId,token);
     const current=await chrome.tabs.get(tabId);
     if(AlphaTrade.assetKey(current.pendingUrl || current.url)!==AlphaTrade.assetKey(url))throw Error('目标币种页已变化');
   }
-  for(let attempt=0;attempt<60 && Date.now()<deadline;attempt++) {
+  for(let attempt=0;attempt<120 && Date.now()<deadline;attempt++) {
     await validateContext();
     try {await withTimeout(ensureContentScriptLoaded(tabId),3000);}
     catch(e) {
       lastError=e;
       if(allowRecovery && !recovered) {
-        recovered=true;await validateContext();await reloadBoundTab(tabId,token);deadline=Date.now()+15000;
+        recovered=true;await validateContext();await reloadBoundTab(tabId,token);deadline=Date.now()+30000;
         continue;
       }
       await sleep(250);continue;
@@ -674,7 +674,7 @@ async function executeTrade(tradeInfo) {
     await windowBinding.authorize(tabId,tradeInfo.bindingToken);
     dispatched = true;
     const result = await withTimeout(chrome.tabs.sendMessage(tabId, {action:'executeTrade',data:{...tradeInfo, attemptId:crypto.randomUUID(), deadline:Date.now()+80000}}), 90000);
-    if (!result || result.protocol !== 4 || !result.data) throw Error('页面返回了旧版或无效回执');
+    if (!result || result.protocol !== 5 || !result.data) throw Error('页面返回了旧版或无效回执');
     assetReadiness.finish(ticket,result.data.bnResp===1 && String(result.data.orderData?.code)==='000000');
     return result.data;
   } catch (e) {
@@ -718,7 +718,7 @@ function sleep(ms) {
  */
 async function ensureContentScriptLoaded(tabId) {
   const reply = await chrome.tabs.sendMessage(tabId, {action:'activatePage'});
-  if (reply?.protocol !== 4 || !reply.authorized) throw Error('请刷新币安标签页以加载新版插件');
+  if (reply?.protocol !== 5 || !reply.authorized) throw Error('请刷新币安标签页以加载新版插件');
 }
 
 /**
