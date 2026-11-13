@@ -3,7 +3,7 @@
  * 处理WebSocket连接和消息分发
  */
 
-importScripts('ws-config.js', 'trade-core.js', 'window-binding.js');
+importScripts('ws-config.js', 'trade-core.js', 'window-binding.js', 'asset-readiness.js');
 
 let ws = null;
 let tradingTabId = null;
@@ -21,6 +21,17 @@ const windowBinding = new AlphaWindow.WindowBinding({
   create:(windowId,url)=>chrome.tabs.create({windowId,url,active:false,pinned:true}),
   remove:id=>chrome.tabs.remove(id),
   token:()=>crypto.randomUUID()
+});
+const assetReadiness = new AlphaAssets.AssetReadiness({
+  busy:()=>isBusy(),
+  check:async trade=>{
+    if(ws!==trade.socket || ws?.readyState!==WebSocket.OPEN)return false;
+    const binding=await windowBinding.require();
+    if(binding.token!==trade.bindingToken)return false;
+    const [chainName,address]=AlphaTrade.assetKey(trade.url).split('/');
+    const result=await handlePageCommand({type:'refresh',data:{chainName,address}},{bindingToken:trade.bindingToken,socket:trade.socket});
+    return result.healthy && result.canTrade;
+  }
 });
 let maintenance = false;
 let acceptingOrders = 0;
@@ -216,6 +227,7 @@ let lastPassiveAssetsAt = 0;
  * （交易后币安前端自动刷新资产时被动捕获，无需重放查询）
  */
 async function reportInterceptedAssets(msg) {
+  void assetReadiness.observe(msg?.data).catch(e=>console.warn(e.message));
   const result = { ok: true, status: 200, data: msg && msg.data };
   try {
     const payload = extractAssetsPayload(result.data);
@@ -242,6 +254,7 @@ async function reportInterceptedAssets(msg) {
 async function handleRefreshAssets(unionId) {
   const result = await refreshAssets();
   if (result.ok) {
+    void assetReadiness.observe(result.data).catch(e=>console.warn(e.message));
     result.report = await reportAssetsBalance(result);
   } else {
     console.warn('资产查询失败，跳过接口上报, HTTP', result.status);
@@ -474,7 +487,7 @@ function handleWebSocketMessage(message) {
   if (message.type === 'order' && message.data) enqueueOrder(message.data);
 }
 
-async function handlePageCommand(message) {
+async function handlePageCommand(message, expected = null) {
   // Server naming is intentional: refresh probes readiness; ready reloads the page.
   const compact = message.type === 'refresh' || message.type === 'ready';
   const reload = message.type === 'ready' || message.type === 'refreshTradePage';
@@ -487,6 +500,7 @@ async function handlePageCommand(message) {
     if(isBusy())throw Error('BUSY: 正在下单或维护，不能检查切页或刷新');
     maintenance=true;locked=true;
     const binding=await windowBinding.require();
+    if(expected && (binding.token!==expected.bindingToken || ws!==expected.socket))throw Error('窗口或连接已变化');
     const url=`https://www.binance.com/zh-CN/alpha/${chainName}/${address}`;
     const tab=await findTabByUrl(url);
     if(!tab)throw Error('绑定窗口中没有该币种页面');
@@ -505,7 +519,7 @@ async function handlePageCommand(message) {
     if(queue.blocked){result.canTrade=false;result.error='QUEUE_BLOCKED';}
     result.windowId=binding.windowId;
   } catch(e){result.healthy=false;result.canTrade=false;result.error=e.message;}
-  finally {if(locked)maintenance=false;}
+  finally {if(locked){maintenance=false;void assetReadiness.flush();}}
   result.checkedAt=Date.now();
   if(replySocket === ws && replySocket?.readyState===WebSocket.OPEN) {
     if(!compact) replySocket.send(JSON.stringify({type:message.type+'Result',data:result}));
@@ -552,7 +566,7 @@ async function enqueueOrder(data) {
     AlphaTrade.assetKey(trade.url);
     await tradeQueue.submit(trade).catch(e => notify('交易队列暂停', e.message));
   } catch (e) { reportTradeResult(AlphaTrade.failure(unionId, 'INVALID_ORDER', e.message)); }
-  finally {if(accepting)acceptingOrders--;}
+  finally {if(accepting)acceptingOrders--;void assetReadiness.flush();}
 }
 
 function reportTradeResult(data) {
@@ -575,6 +589,7 @@ tradeQueue.ready.catch(e => notify('交易队列无法初始化', e.message));
  * @param {Object} tradeInfo - 交易信息
  */
 async function executeTrade(tradeInfo) {
+  const ticket=assetReadiness.begin({...tradeInfo,socket:ws});
   let dispatched = false;
   try {
     const binding = await windowBinding.require();
@@ -592,8 +607,10 @@ async function executeTrade(tradeInfo) {
     dispatched = true;
     const result = await withTimeout(chrome.tabs.sendMessage(tabId, {action:'executeTrade',data:{...tradeInfo, deadline:Date.now()+80000}}), 90000);
     if (!result || result.protocol !== 3 || !result.data) throw Error('页面返回了旧版或无效回执');
+    assetReadiness.finish(ticket,result.data.bnResp===1 && String(result.data.orderData?.code)==='000000');
     return result.data;
   } catch (e) {
+    assetReadiness.finish(ticket,false);
     return AlphaTrade.failure(tradeInfo.unionId, dispatched ? 'ORDER_STATUS_UNKNOWN' : 'PAGE_NOT_READY', e.message);
   }
 }
@@ -701,7 +718,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           chrome.tabs.sendMessage(tab.id,{action:'activatePage'}).catch(()=>{});
         }
         return {success:true,windowId:b.windowId};
-      } finally {maintenance=false;}
+      } finally {maintenance=false;void assetReadiness.flush();}
     })().then(sendResponse).catch(e=>sendResponse({error:e.message}));
     return true;
   }
@@ -748,7 +765,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       wsUrl=WS_CONFIG.buildUrl(request.number);
       await chrome.storage.local.set({browserNumber:request.number,wsUrl});
       connectWebSocket();return {success:true};
-      } finally {maintenance=false;}
+      } finally {maintenance=false;void assetReadiness.flush();}
     })().then(sendResponse).catch(e=>sendResponse({error:e.message}));
   } else if (request.action === 'testTrade') {
     enqueueOrder(request.data);
