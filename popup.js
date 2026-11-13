@@ -15,38 +15,8 @@ document.addEventListener('DOMContentLoaded', () => {
   /**
    * 从存储中加载已保存的编号
    */
-  WS_CONFIG.load().then((result) => {
-    if (result.browserNumber) {
-      browserNumberInput.value = result.browserNumber;
-      
-      // 如果有保存的编号，10秒后自动连接
-      statusDiv.textContent = 'WebSocket: 10秒后自动连接...';
-      statusDiv.className = 'status';
-      
-      autoConnectTimer = setTimeout(() => {
-        connectWebSocket();
-      }, 10000);
-    }
-  });
-  
-  /**
-   * 编号输入框变化时保存
-   */
-  browserNumberInput.addEventListener('input', () => {
-    const number = browserNumberInput.value.trim();
-    if (number) {
-      chrome.storage.local.set({ browserNumber: number });
-    } else {
-      chrome.storage.local.remove('browserNumber');
-    }
-    
-    // 取消自动连接定时器
-    if (autoConnectTimer) {
-      clearTimeout(autoConnectTimer);
-      autoConnectTimer = null;
-    }
-  });
-  
+  WS_CONFIG.load().then(result=>{browserNumberInput.value=result.browserNumber || '';});
+  // Commit the instance number only when the user explicitly connects.
   /**
    * 连接WebSocket
    */
@@ -63,17 +33,15 @@ document.addEventListener('DOMContentLoaded', () => {
     
     chrome.runtime.sendMessage({
       action: 'connectWS',
-      url: wsUrl
+      number
     }, (response) => {
       if (response && response.success) {
         statusDiv.textContent = 'WebSocket: 正在连接...';
         statusDiv.className = 'status';
         
-        // 3秒后更新状态
-        setTimeout(() => {
-          statusDiv.textContent = 'WebSocket: 已连接';
-          statusDiv.className = 'status connected';
-        }, 3000);
+      } else {
+        statusDiv.textContent=response?.error || '连接失败';
+        statusDiv.className='status disconnected';
       }
     });
   }
@@ -94,11 +62,9 @@ document.addEventListener('DOMContentLoaded', () => {
   /**
    * 创建交易标签页按钮点击事件
    */
-  createTabBtn.addEventListener('click', () => {
-    chrome.tabs.create({
-      url: 'https://www.binance.com/zh-CN/alpha',
-      active: false
-    });
+  createTabBtn.addEventListener('click', async () => {
+    const response=await chrome.runtime.sendMessage({action:'openAlpha'});
+    if(response.error)alert(response.error);
   });
 
   /**
@@ -214,4 +180,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (result.error) info.textContent=result.error; else await refresh();
   });
   await refresh();
+});
+
+document.addEventListener('DOMContentLoaded',async()=>{
+  const info=document.getElementById('bindingInfo');
+  async function showBinding(){
+    const state=await chrome.runtime.sendMessage({action:'bindingStatus'});
+    info.textContent=`实例 ID：${state.instanceId}；`+(state.bound?`已绑定窗口 ${state.windowId}`:`未绑定：${state.error}`);
+  }
+  document.getElementById('bindWindowBtn').addEventListener('click',async()=>{
+    const window=await chrome.windows.getCurrent();
+    if(window.incognito || window.type!=='normal'){info.textContent='请在普通窗口绑定';return;}
+    const result=await chrome.runtime.sendMessage({action:'bindWindow',windowId:window.id});
+    if(result.error)info.textContent=result.error;else await showBinding();
+  });
+  await showBinding();
 });

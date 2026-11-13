@@ -8,33 +8,53 @@ let activeTrade = null;
 
 console.log('币安Alpha交易助手 - Content Script已加载');
 
-// 只注入一次拦截脚本
-if (!window.__INTERCEPTOR_INJECTED__) {
-  window.__INTERCEPTOR_INJECTED__ = true;
-  injectInterceptorScript();
+const instanceId = chrome.runtime.id;
+let pageBinding = null;
+let injectionPromise = null;
+function bridgePost(data) {window.postMessage({...data,instanceId,token:pageBinding}, '*');}
+async function checkPageAuthority(token = pageBinding) {
+  const response = await chrome.runtime.sendMessage({action:'authorizePage',token});
+  if(!response?.authorized || (token && response.token !== token)) {
+    pageBinding=null;
+    throw Error(response?.error || '当前页面未绑定本插件');
+  }
+  return response;
 }
-
-/**
- * 注入拦截脚本到页面
- */
-function injectInterceptorScript() {
-  const script = document.createElement('script');
-  script.src = chrome.runtime.getURL('injected.js');
-  script.onload = function() {
-    console.log('✅ 拦截脚本已通过script标签加载');
-    this.remove();
-  };
-  script.onerror = function() {
-    console.error('❌ 拦截脚本加载失败');
-  };
-  (document.head || document.documentElement).appendChild(script);
+async function activatePage() {
+  const response=await checkPageAuthority();
+  pageBinding=response.token;
+  if(!injectionPromise) injectionPromise=new Promise((resolve,reject)=>{
+    const script=document.createElement('script');
+    script.src=chrome.runtime.getURL('injected.js');
+    script.dataset.alphaInstance=instanceId;
+    script.dataset.alphaToken=pageBinding;
+    script.onload=()=>{script.remove();resolve();};
+    script.onerror=()=>{script.remove();injectionPromise=null;reject(Error('回执监听加载失败'));};
+    (document.head || document.documentElement).appendChild(script);
+  });
+  await injectionPromise;
+  bridgePost({type:'ALPHA_ENABLE'});
+  return {protocol:3,authorized:true};
+}
+// Unbound copies remain inert and do not install page-world interceptors.
+activatePage().catch(()=>{});
+async function authorizedClick(element, beforeClick = () => {}) {
+  await checkPageAuthority(activeTrade?.token || pageBinding);
+  if(activeTrade) {
+    if(Date.now()>=activeTrade.deadline)throw Error('订单执行期限已过');
+    if(AlphaTrade.assetKey(location.href)!==AlphaTrade.assetKey(activeTrade.url))throw Error('页面币种已变化');
+    if(activeTrade.receipt)return false;
+  }
+  beforeClick();
+  element.click();
+  return true;
 }
 
 /**
  * 监听页面发送的消息（fetch拦截结果）
  */
 window.addEventListener('message', (event) => {
-  if (event.source !== window || !event.data) return;
+  if (event.source !== window || !event.data || event.data.instanceId !== instanceId || !pageBinding || event.data.token !== pageBinding) return;
   
   if (event.data.type === 'ALPHA_HEADERS_CAPTURED') {
     console.log('====== 捕获到私有接口请求头 ======');
@@ -45,7 +65,7 @@ window.addEventListener('message', (event) => {
     // 转发到 background script 存储（值不出本机，仅用于重放资产查询）
     try {
       chrome.runtime.sendMessage({
-        action: 'alphaHeadersCaptured',
+        action: 'alphaHeadersCaptured', token:pageBinding,
         data: {
           url: event.data.url,
           method: event.data.method,
@@ -64,7 +84,7 @@ window.addEventListener('message', (event) => {
     // 页面自身拉到的资产数据（交易后币安前端自动刷新），转发 background 上报
     try {
       chrome.runtime.sendMessage({
-        action: 'alphaAssetsData',
+        action: 'alphaAssetsData', token:pageBinding,
         data: {
           url: event.data.url,
           data: event.data.data
@@ -88,13 +108,19 @@ window.addEventListener('message', (event) => {
  * 监听来自background script的消息
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'activatePage') {
+    activatePage().then(sendResponse).catch(e=>sendResponse({protocol:3,authorized:false,error:e.message}));return true;
+  }
+  if (request.action === 'checkReady') {
+    checkPageReady().then(sendResponse).catch(e=>sendResponse({healthy:false,canTrade:false,error:e.message}));return true;
+  }
   if (request.action === 'ping') {
     // 响应ping消息，表示content script已就绪
-    sendResponse({ success: true, ready: true, protocol:2 });
+    sendResponse({ success: true, ready: true, protocol:3 });
     return true;
   } else if (request.action === 'executeTrade') {
     executeTradeOnPage(request.data)
-      .then(data => sendResponse({ protocol:2, data }))
+      .then(data => sendResponse({ protocol:3, data }))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true; // 保持消息通道打开
   }
@@ -107,9 +133,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 async function executeTradeOnPage(tradeInfo) {
   const {url, price, amount, direction, coin, unionId, deadline:executionDeadline} = tradeInfo;
   if (activeTrade) return AlphaTrade.failure(unionId, 'ORDER_STATUS_UNKNOWN', '页面已有未完成的订单，请核对订单');
-  const trade = {id:unionId, armed:false, receipt:null, clicked:false};
+  const trade = {id:unionId, armed:false, receipt:null, clicked:false,token:tradeInfo.bindingToken,deadline:executionDeadline,url};
   activeTrade = trade;
   try {
+    if(!pageBinding || pageBinding!==trade.token)throw Error('窗口绑定已变化');
+    await checkPageAuthority(trade.token);
     const checkAsset = () => {
       if (!Number.isFinite(executionDeadline) || Date.now() >= executionDeadline) throw Error('订单执行期限已过，禁止继续点击');
       if (AlphaTrade.assetKey(location.href) !== AlphaTrade.assetKey(url)) throw Error('页面币种与订单不符');
@@ -120,12 +148,14 @@ async function executeTradeOnPage(tradeInfo) {
     await clickTradeTab(direction);
     await ensureLimitOrderTab();
     await sleep(500);
+    await checkPageAuthority(trade.token);
     await setInputValue('limitPrice', price);
+    await checkPageAuthority(trade.token);
     await setInputValue('limitAmount', amount);
     await sleep(300);
     checkAsset();
     // Arm the interceptor and wait for acknowledgment before allowing a click.
-    window.postMessage({type:'ALPHA_ARM_ORDER', unionId}, '*');
+    bridgePost({type:'ALPHA_ARM_ORDER', unionId});
     const armDeadline = Date.now()+2000;
     while (!trade.armed && Date.now()<armDeadline) await sleep(25);
     if (!trade.armed) throw Error('订单回执拦截器未就绪，请刷新页面');
@@ -140,7 +170,7 @@ async function executeTradeOnPage(tradeInfo) {
   } catch (e) {
     return trade.receipt || AlphaTrade.failure(unionId,trade.clicked ? 'ORDER_STATUS_UNKNOWN' : 'EXECUTION_ERROR',e.message);
   } finally {
-    window.postMessage({type:'ALPHA_DISARM_ORDER',unionId}, '*');
+    bridgePost({type:'ALPHA_DISARM_ORDER',unionId});
     activeTrade = null;
   }
 }
@@ -182,7 +212,7 @@ async function clickTradeTab(direction) {
   }
 
   console.log(`点击${wantText}标签:`, (tab.textContent || '').trim());
-  tab.click();
+  await authorizedClick(tab);
 }
 
 /**
@@ -192,7 +222,7 @@ async function ensureLimitOrderTab() {
   const limitTab = document.querySelector('#bn-tab-LIMIT');
   if (limitTab && !limitTab.classList.contains('active')) {
     console.log('当前不是限价单，切换到限价');
-    limitTab.click();
+    await authorizedClick(limitTab);
     await sleep(300);
   }
 }
@@ -249,8 +279,7 @@ async function clickSubmitButton(direction, coin, beforeClick) {
     if (buttonText.includes(coin)) {
       console.log(`找到匹配的按钮，准备点击: "${buttonText}"`);
       await sleep(200);
-      beforeClick();
-      button.click();
+      await authorizedClick(button,beforeClick);
       console.log('按钮已点击');
       return;
     }
@@ -273,7 +302,7 @@ async function clickKnowItButton() {
       if (buttonText === '我知道了') {
         console.log('找到"我知道了"按钮，准备点击:', button);
         await sleep(300);
-        button.click();
+        await authorizedClick(button);
         console.log('"我知道了"按钮已点击');
         await sleep(500); // 等待弹窗关闭
         return;
@@ -314,7 +343,7 @@ async function clickDialogConfirmButton(trade, checkAsset) {
           await sleep(200);
           if (trade.receipt) return false;
           checkAsset();
-          btn.click();
+          await authorizedClick(btn);
           return true;
         }
       }
@@ -367,3 +396,13 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+
+async function checkPageReady() {
+  await checkPageAuthority();
+  const visible=e=>!!(e && e.offsetParent!==null);
+  const controls=['limitPrice','limitAmount'].every(id=>visible(document.getElementById(id)));
+  const buttons=Array.from(document.querySelectorAll('button[class*="bn-button__buy"],button[class*="bn-button__sell"]')).filter(visible);
+  const loginRequired=buttons.some(b=>/登录|Log In|Sign In/i.test(b.textContent || ''));
+  const healthy=document.readyState==='complete' && controls && buttons.length>0 && !loginRequired;
+  return {healthy,canTrade:healthy && !activeTrade && buttons.some(b=>!b.disabled),loginRequired,url:location.href,checkedAt:Date.now()};
+}

@@ -103,3 +103,26 @@ WebSocket消息格式：
 - 更新：先在 chrome://extensions/ 重载插件，再刷新所有已打开的币安交易页。
 - 自动交易期间不要手动操作交易表单；同账户各币种共享余额。
 验证：node --test tests/*.test.cjs（模拟浏览器接口与页面，不发送真实交易）。
+
+
+1.2.0 同一Chrome用户、多窗口、多插件副本
+1. 先停用旧版副本；所有启用副本必须使用1.2.0，刷新现有币安页。
+2. 每个副本在目标普通窗口打开插件弹窗，点击“绑定当前窗口”。
+3. 窗口会新增固定的“Alpha 实例控制”标签页，必须保留；同窗口不能绑定第二个副本。
+4. 输入服务器分配的独立数字编号，点击连接。新安装不再默认连23。
+5. 每份插件只操作其绑定窗口。控制页关闭/移走后拒绝继续交易；浏览器重启需重新绑定。
+6. 交易页面被拖到其他窗口时，原插件拒绝继续点击。绑定变更前必须无在途订单。
+7. 同账号余额共享。服务器须确保同一订单不同时发给多个实例；结果不明不能换实例重下。
+8. 生成独立ID副本：node scripts/make-instance.cjs /绝对路径/新目录 A
+   每次新目录生成一个公钥对应的固定扩展ID。更新已安装副本时必须保留原manifest.key，不能重生成ID。
+
+服务器指令（只操作已绑定窗口，不修改服务器现有下单协议）
+检查：{"type":"checkTradeReady","data":{"requestId":"r1","chainName":"bsc","address":"合约地址"}}
+刷新：{"type":"refreshTradePage","data":{"requestId":"r2","chainName":"bsc","address":"合约地址"}}
+响应type分别是checkTradeReadyResult、refreshTradePageResult。
+data包含原requestId、instanceId、checkedAt、healthy、canTrade、失败error；成功时含windowId及页面url。
+刷新确实完成时含refreshed:true；刷新成功不等于登录/表单已就绪，仍须检查healthy/canTrade。
+healthy检查页面加载、输入框、交易按钮和登录提示；canTrade还检查队列与当前按钮是否可用。
+这是当前页面状态，不保证余额充足或币安必然接受下一单。下单仍重新检查窗口与币种。
+正在下单/接单/维护时，检查和刷新返回BUSY，不抢焦点、不刷新交易中的页面。
+检查不到目标币种页直接返回错误，不查找其他窗口。

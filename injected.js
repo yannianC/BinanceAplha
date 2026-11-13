@@ -6,25 +6,24 @@
  */
 
 (function() {
-  // 防止重复注入
-  if (window.__BINANCE_INTERCEPTOR_LOADED__) {
-    console.log('⚠️ API拦截器已存在，跳过重复注入');
-    return;
-  }
-
-  console.log('%c=== API拦截器已注入(injected.js) ===', 'color: green; font-size: 16px; font-weight: bold;');
-
-  // 标记拦截器已加载
-  window.__BINANCE_INTERCEPTOR_LOADED__ = true;
+  const instanceId=document.currentScript?.dataset.alphaInstance;
+  let token=document.currentScript?.dataset.alphaToken;
+  if(!instanceId || !token)return;
+  const installed=window.__ALPHA_INSTANCE_HOOKS__ ||= {};
+  if(installed[instanceId])return;
+  installed[instanceId]=true;
+  function post(data, responseToken=token) {window.postMessage({...data,instanceId,token:responseToken}, '*');}
 
   // ============ 目标接口 ============
   const ORDER_PLACE_PATH = '/bapi/asset/v1/private/alpha-trade/order/place';
   let armedOrder = null;
   window.addEventListener('message', event => {
-    if (event.source !== window || !event.data) return;
+    if (event.source !== window || !event.data || event.data.instanceId !== instanceId) return;
+    if(event.data.type==='ALPHA_ENABLE') {if(token!==event.data.token)armedOrder=null;token=event.data.token;return;}
+    if(event.data.token !== token)return;
     if (event.data.type === 'ALPHA_ARM_ORDER') {
       armedOrder = event.data.unionId;
-      window.postMessage({type:'ALPHA_ORDER_ARMED',unionId:armedOrder}, '*');
+      post({type:'ALPHA_ORDER_ARMED',unionId:armedOrder});
     } else if (event.data.type === 'ALPHA_DISARM_ORDER' && armedOrder === event.data.unionId) armedOrder = null;
   });
   function takeOrderId(url) {
@@ -68,17 +67,17 @@
       at: Date.now()
     };
     // 调试可读（主世界）
-    window.__ALPHA_HEADERS__ = record;
+    // Headers are sent only through this instance's namespaced bridge.
     console.log('%c捕获到私有接口请求头:', 'color: purple; font-weight: bold;', url, '字段数:', Object.keys(headers).length);
     // 转发给 content.js（值不出本机）
     try {
-      window.postMessage({
+      post({
         type: 'ALPHA_HEADERS_CAPTURED',
         url: record.url,
         method: record.method,
         headers: record.headers,
         at: record.at
-      }, '*');
+      });
     } catch (e) {}
   }
 
@@ -111,6 +110,7 @@
     }
 
     const orderId = takeOrderId(url);
+    const responseToken=token;
     return originalFetch.apply(this, args).then(response => {
       // 克隆response以便我们可以读取它
       const clonedResponse = response.clone();
@@ -121,23 +121,23 @@
         clonedResponse.json().then(data => {
           console.log('%cFetch响应数据:', 'color: red; font-size: 14px;', data);
           // 将响应数据发送到页面
-          window.postMessage({
+          post({
             type: 'FETCH_RESPONSE',
             unionId: orderId,
             url: url,
             data: data
-          }, '*');
+          }, responseToken);
         }).catch(err => {
           console.error('解析Fetch响应失败:', err);
         });
       } else if (shouldCaptureHeaders(url)) {
         // 资产接口：捕获响应体（币安前端交易后自动刷新资产时被动拿到最新数据）
         clonedResponse.json().then(data => {
-          window.postMessage({
+          post({
             type: 'ALPHA_ASSETS_DATA',
             url: url,
             data: data
-          }, '*');
+          }, responseToken);
         }).catch(() => {});
       }
 
@@ -178,6 +178,7 @@
 
   XMLHttpRequest.prototype.send = function(...args) {
     const orderId = takeOrderId(this._url || "");
+    const responseToken=token;
     // 捕获请求头 + 响应体（资产接口）
     if (this._url && shouldCaptureHeaders(this._url)) {
       try {
@@ -186,11 +187,11 @@
         this.addEventListener('load', function() {
           try {
             const data = JSON.parse(this.responseText);
-            window.postMessage({
+            post({
               type: 'ALPHA_ASSETS_DATA',
               url: this._url,
               data: data
-            }, '*');
+            }, responseToken);
           } catch (e) {}
         });
       } catch (e) {}
@@ -203,12 +204,12 @@
         try {
           const data = JSON.parse(this.responseText);
           console.log('%cXHR响应数据:', 'color: red; font-size: 14px;', data);
-          window.postMessage({
+          post({
             type: 'FETCH_RESPONSE',
             unionId: orderId,
             url: this._url,
             data: data
-          }, '*');
+          }, responseToken);
         } catch (err) {
           console.error('解析XHR响应失败:', err);
         }

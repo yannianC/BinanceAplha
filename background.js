@@ -3,7 +3,7 @@
  * 处理WebSocket连接和消息分发
  */
 
-importScripts('ws-config.js', 'trade-core.js');
+importScripts('ws-config.js', 'trade-core.js', 'window-binding.js');
 
 let ws = null;
 let tradingTabId = null;
@@ -11,6 +11,24 @@ let wsUrl = 'ws://localhost:8080'; // 默认WebSocket地址，后续可以配置
 let heartbeatTimer = null; // 心跳定时器
 let heartbeatCheckTimer = null; // 心跳检查定时器
 let lastHeartbeatTime = null; // 上次收到心跳响应的时间
+
+const windowBinding = new AlphaWindow.WindowBinding({
+  id:chrome.runtime.id,
+  load:async()=>(await chrome.storage.session.get('windowBinding')).windowBinding,
+  save:b=>chrome.storage.session.set({windowBinding:b}),
+  query:windowId=>chrome.tabs.query({windowId}),
+  get:id=>chrome.tabs.get(id),
+  create:(windowId,url)=>chrome.tabs.create({windowId,url,active:false,pinned:true}),
+  remove:id=>chrome.tabs.remove(id),
+  token:()=>crypto.randomUUID()
+});
+let maintenance = false;
+let acceptingOrders = 0;
+async function authorizeSender(sender, token) {
+  if(sender.frameId !== 0 || !sender.tab || !sender.url?.startsWith('https://www.binance.com/')) throw Error('无效页面来源');
+  return windowBinding.authorize(sender.tab.id,token);
+}
+function isBusy() {return maintenance || acceptingOrders > 0 || tradeQueue.pending > 0;}
 
 // ============ 持有资产查询（cloud-wallet/alpha）============
 // 资产接口地址
@@ -77,6 +95,7 @@ async function loadAlphaHeaders() {
  * 返回 { ok, status, data }
  */
 async function refreshAssets() {
+  await windowBinding.require();
   const record = await loadAlphaHeaders();
 
   if (!record || !record.headers || Object.keys(record.headers).length === 0) {
@@ -235,8 +254,9 @@ async function handleRefreshAssets(unionId) {
  */
 try {
   chrome.webRequest.onBeforeSendHeaders.addListener(
-    (details) => {
+    async (details) => {
       try {
+        await windowBinding.authorize(details.tabId);
         const headers = {};
         (details.requestHeaders || []).forEach((h) => {
           headers[h.name] = h.value;
@@ -296,7 +316,7 @@ function connectWebSocket() {
         if (sock !== ws) return;
         if (record && record.headers && Object.keys(record.headers).length > 0) {
           console.log('连接建立，主动刷新一次持有资产...');
-          handleRefreshAssets('startup');
+          handleRefreshAssets('startup').catch(()=>{});
         } else {
           console.log('尚无捕获的请求头，跳过启动资产刷新（打开币安Alpha页面后会自动捕获）');
         }
@@ -446,16 +466,69 @@ function handleWebSocketMessage(message) {
   if (message.type === 'refreshAssets') {
     const unionId = (message.data && message.data.unionId) || '';
     console.log('收到刷新资产指令, unionId:', unionId);
-    handleRefreshAssets(unionId);
+    handleRefreshAssets(unionId).catch(e=>console.warn(e.message));
     return;
   }
 
+  if (['checkTradeReady','refreshTradePage'].includes(message.type)) { handlePageCommand(message); return; }
   if (message.type === 'order' && message.data) enqueueOrder(message.data);
 }
 
-function enqueueOrder(data) {
-  const {chainName, address, amt, symbol, price, unionId} = data;
+async function handlePageCommand(message) {
+  const {requestId,chainName,address}=message.data || {};
+  const result={requestId,healthy:false,canTrade:false,checkedAt:Date.now(),instanceId:chrome.runtime.id};
+  let locked=false;
   try {
+    if(typeof requestId!=='string' || !requestId || !/^[a-z0-9_-]+$/i.test(chainName || '') || !/^[a-z0-9_-]+$/i.test(address || '')) throw Error('无效检查参数');
+    if(isBusy())throw Error('BUSY: 正在下单或维护，不能检查切页或刷新');
+    maintenance=true;locked=true;
+    const binding=await windowBinding.require();
+    const url=`https://www.binance.com/zh-CN/alpha/${chainName}/${address}`;
+    const tab=await findTabByUrl(url);
+    if(!tab)throw Error('绑定窗口中没有该币种页面');
+    await windowBinding.authorize(tab.id,binding.token);
+    await chrome.tabs.update(tab.id,{active:true});
+    if(message.type==='refreshTradePage') {
+      await reloadBoundTab(tab.id,binding.token);
+      result.refreshed=true;
+    } else await waitForTabLoaded(tab.id);
+    await windowBinding.authorize(tab.id,binding.token);
+    await ensureContentScriptLoaded(tab.id);
+    const page=await withTimeout(chrome.tabs.sendMessage(tab.id,{action:'checkReady'}),5000);
+    if(AlphaTrade.assetKey(page?.url)!==AlphaTrade.assetKey(url))throw Error('币种已变化');
+    Object.assign(result,page);
+    const queue=await tradeQueue.status();
+    if(queue.blocked){result.canTrade=false;result.error='QUEUE_BLOCKED';}
+    result.windowId=binding.windowId;
+  } catch(e){result.healthy=false;result.canTrade=false;result.error=e.message;}
+  finally {if(locked)maintenance=false;}
+  result.checkedAt=Date.now();
+  if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:message.type+'Result',data:result}));
+  return result;
+}
+async function reloadBoundTab(tabId, token) {
+  await windowBinding.authorize(tabId,token);
+  let listener,removed;
+  const loaded=new Promise((resolve,reject)=>{
+    listener=(id,info)=>{if(id===tabId && info.status==='complete')resolve();};
+    removed=id=>{if(id===tabId)reject(Error('刷新期间标签页被关闭'));};
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.onRemoved.addListener(removed);
+    chrome.tabs.reload(tabId).catch(reject);
+  });
+  try {await withTimeout(loaded,30000);}
+  finally {chrome.tabs.onUpdated.removeListener(listener);chrome.tabs.onRemoved.removeListener(removed);}
+  await windowBinding.authorize(tabId,token);
+}
+
+async function enqueueOrder(data) {
+  const {chainName, address, amt, symbol, price, unionId} = data;
+  let accepting=false;
+  try {
+    if (maintenance) throw Error('窗口正在绑定或刷新，暂不接单');
+    acceptingOrders++;accepting=true;
+    const binding = await windowBinding.require();
+    if (maintenance) throw Error('窗口正在维护');
     if (typeof unionId !== 'string' || !unionId || unionId.length > 160) throw Error('订单编号必须是非空字符串');
     if (!/^[a-z0-9_-]+$/i.test(chainName || '') || !/^[a-z0-9_-]+$/i.test(address || '')) throw Error('无效链或合约地址');
     const decimal = /^-?\d+(?:\.\d+)?$/;
@@ -465,18 +538,19 @@ function enqueueOrder(data) {
     const trade = {
       url: `https://www.binance.com/zh-CN/alpha/${chainName}/${address}`,
       price: String(price), amount: String(amt).replace(/^-/, ''),
-      direction: Number(amt) > 0 ? 'Buy' : 'Sell', coin: symbol, unionId
+      direction: Number(amt) > 0 ? 'Buy' : 'Sell', coin: symbol, unionId, bindingToken:binding.token
     };
     AlphaTrade.assetKey(trade.url);
-    tradeQueue.submit(trade).catch(e => notify('交易队列暂停', e.message));
+    await tradeQueue.submit(trade).catch(e => notify('交易队列暂停', e.message));
   } catch (e) { reportTradeResult(AlphaTrade.failure(unionId, 'INVALID_ORDER', e.message)); }
+  finally {if(accepting)acceptingOrders--;}
 }
 
 function reportTradeResult(data) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'orderResult',data}));
   const od = data.orderData || {};
   notify(data.bnResp === 1 ? '下单回执' : '下单未完成', `${data.unionId}: ${od.code || ''} ${od.message || ''}`);
-  if (data.bnResp === 1 && String(od.code) === '000000') setTimeout(() => handleRefreshAssets('after-trade'), 5000);
+  if (data.bnResp === 1 && String(od.code) === '000000') setTimeout(() => handleRefreshAssets('after-trade').catch(()=>{}), 5000);
 }
 const tradeQueue = new AlphaTrade.TradeQueue({
   load: async () => (await chrome.storage.local.get('alphaOrderJournal')).alphaOrderJournal || {},
@@ -494,17 +568,21 @@ tradeQueue.ready.catch(e => notify('交易队列无法初始化', e.message));
 async function executeTrade(tradeInfo) {
   let dispatched = false;
   try {
+    const binding = await windowBinding.require();
+    if (binding.token !== tradeInfo.bindingToken) throw Error('订单所属窗口绑定已变化，请重新检查');
     const tab = await getOrCreateTradingTab(tradeInfo.url);
     const tabId = tab.id; // Local to this order; never use mutable shared routing state.
+    await windowBinding.authorize(tabId,tradeInfo.bindingToken);
     tradingTabId = tabId; // Popup display only.
     await chrome.tabs.update(tabId, {active:true, autoDiscardable:false});
     await waitForTabLoaded(tabId);
     await ensureContentScriptLoaded(tabId);
     const current = await chrome.tabs.get(tabId);
     if (AlphaTrade.assetKey(current.url) !== AlphaTrade.assetKey(tradeInfo.url)) throw Error('标签页已切换到其他币种');
+    await windowBinding.authorize(tabId,tradeInfo.bindingToken);
     dispatched = true;
     const result = await withTimeout(chrome.tabs.sendMessage(tabId, {action:'executeTrade',data:{...tradeInfo, deadline:Date.now()+80000}}), 90000);
-    if (!result || result.protocol !== 2 || !result.data) throw Error('页面返回了旧版或无效回执');
+    if (!result || result.protocol !== 3 || !result.data) throw Error('页面返回了旧版或无效回执');
     return result.data;
   } catch (e) {
     return AlphaTrade.failure(tradeInfo.unionId, dispatched ? 'ORDER_STATUS_UNKNOWN' : 'PAGE_NOT_READY', e.message);
@@ -513,10 +591,12 @@ async function executeTrade(tradeInfo) {
 
 const tabCreations = new Map();
 async function getOrCreateTradingTab(url) {
-  const key = AlphaTrade.assetKey(url);
+  const binding = await windowBinding.require();
+  const key = binding.token + ':' + AlphaTrade.assetKey(url);
   if (tabCreations.has(key)) return tabCreations.get(key);
   const creation = (async()=>{
-    const tab = await findTabByUrl(url) || await chrome.tabs.create({url,active:false});
+    const tab = await findTabByUrl(url) || await chrome.tabs.create({url,windowId:binding.windowId,active:false});
+    await windowBinding.authorize(tab.id,binding.token);
     await chrome.tabs.update(tab.id, {autoDiscardable:false});
     return tab;
   })();
@@ -543,8 +623,8 @@ function sleep(ms) {
  * @param {number} tabId - 标签页ID
  */
 async function ensureContentScriptLoaded(tabId) {
-  const reply = await chrome.tabs.sendMessage(tabId, {action:'ping'});
-  if (reply?.protocol !== 2) throw Error('请刷新币安标签页以加载新版插件');
+  const reply = await chrome.tabs.sendMessage(tabId, {action:'activatePage'});
+  if (reply?.protocol !== 3 || !reply.authorized) throw Error('请刷新币安标签页以加载新版插件');
 }
 
 /**
@@ -554,7 +634,8 @@ async function ensureContentScriptLoaded(tabId) {
  */
 async function findTabByUrl(url) {
   try {
-    const tabs = await chrome.tabs.query({});
+    const binding = await windowBinding.require();
+    const tabs = await chrome.tabs.query({windowId:binding.windowId});
     
     // 查找完全匹配的标签页
     for (const tab of tabs) {
@@ -588,32 +669,47 @@ async function waitForTabLoaded(tabId) {
  * 监听来自content script的消息
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (['testTrade','resumeQueue','preloadTabs'].includes(request.action) && sender.url !== chrome.runtime.getURL('popup.html')) { sendResponse({error:'仅插件弹窗可操作'}); return false; }
+  if (['testTrade','resumeQueue','preloadTabs','bindWindow','openAlpha','connectWS','refreshAssetsTest'].includes(request.action) && sender.url !== chrome.runtime.getURL('popup.html')) { sendResponse({error:'仅插件弹窗可操作'}); return false; }
+  if (request.action === 'authorizePage') {
+    authorizeSender(sender,request.token).then(b=>sendResponse({authorized:true,token:b.token,instanceId:chrome.runtime.id})).catch(e=>sendResponse({authorized:false,error:e.message}));
+    return true;
+  }
+  if (['alphaHeadersCaptured','alphaAssetsData'].includes(request.action)) {
+    authorizeSender(sender,request.token).then(()=>{
+      if(request.action==='alphaHeadersCaptured') {saveAlphaHeaders({...request.data,at:Date.now(),source:'injected'});sendResponse({success:true});}
+      else reportInterceptedAssets(request.data).then(sendResponse).catch(e=>sendResponse({error:e.message}));
+    }).catch(e=>sendResponse({error:e.message}));
+    return true;
+  }
+  if (request.action === 'bindWindow') {
+    (async()=>{
+      if(isBusy()) throw Error('有订单或维护操作进行中，不能更改窗口绑定');
+      maintenance=true;
+      try {
+        const b=await windowBinding.bind(request.windowId);
+        alphaHeadersCache=null;await chrome.storage.local.remove('alphaHeaders');
+        for(const tab of await chrome.tabs.query({windowId:b.windowId,url:'https://www.binance.com/*'})) {
+          chrome.tabs.sendMessage(tab.id,{action:'activatePage'}).catch(()=>{});
+        }
+        return {success:true,windowId:b.windowId};
+      } finally {maintenance=false;}
+    })().then(sendResponse).catch(e=>sendResponse({error:e.message}));
+    return true;
+  }
+  if (request.action === 'bindingStatus') {
+    windowBinding.require().then(b=>sendResponse({bound:true,windowId:b.windowId,instanceId:chrome.runtime.id})).catch(e=>sendResponse({bound:false,error:e.message,instanceId:chrome.runtime.id}));return true;
+  }
+  if (request.action === 'openAlpha') {
+    windowBinding.require().then(b=>chrome.tabs.create({windowId:b.windowId,url:'https://www.binance.com/zh-CN/alpha',active:false})).then(()=>sendResponse({success:true})).catch(e=>sendResponse({error:e.message}));return true;
+  }
   if (request.action === 'tradeResult') {
     // Old pages must be refreshed; unsolicited page results cannot complete queued orders.
     sendResponse({success:false});
-  } else if (request.action === 'alphaHeadersCaptured') {
-    // content.js 转发来的资产接口请求头（injected.js 捕获）
-    saveAlphaHeaders({
-      url: request.data.url,
-      method: request.data.method,
-      headers: request.data.headers,
-      at: request.data.at || Date.now(),
-      source: 'injected'
-    });
-    console.log('已保存injected捕获的请求头，字段数:', Object.keys(request.data.headers || {}).length);
-    sendResponse({ success: true });
   } else if (request.action === 'refreshAssetsTest') {
     // popup 测试按钮：重放资产查询
     handleRefreshAssets('popup-test').then((result) => {
       sendResponse({ success: result.ok, status: result.status, data: result.data });
-    });
-    return true; // 异步响应
-  } else if (request.action === 'alphaAssetsData') {
-    // 页面拉取的资产数据（交易后币安前端自动刷新被动捕获）→ HTTP 上报
-    reportInterceptedAssets(request.data).then((r) => {
-      sendResponse({ success: r.ok, skipped: !!r.skipped });
-    });
+    }).catch(e=>sendResponse({success:false,error:e.message}));
     return true; // 异步响应
   } else if (request.action === 'getCapturedHeadersInfo') {
     // popup 查询捕获状态（只回字段名和时间，不回值）
@@ -634,13 +730,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   } else if (request.action === 'getTabId') {
     sendResponse({ tabId: tradingTabId });
   } else if (request.action === 'connectWS') {
-    if (request.url) {
-      wsUrl = request.url;
-      // 保存地址，供后台自动连接使用（SW重启/浏览器重启后无需再开popup）
-      try { chrome.storage.local.set({ wsUrl: wsUrl }); } catch (e) {}
-    }
-    connectWebSocket();
-    sendResponse({ success: true });
+    (async()=>{
+      if(isBusy()) throw Error('订单执行期间不能更换连接编号');
+      maintenance=true;
+      try {
+      await windowBinding.require();
+      if(!/^\d{1,12}$/.test(request.number || ''))throw Error('请输入1至12位数字编号');
+      wsUrl=WS_CONFIG.buildUrl(request.number);
+      await chrome.storage.local.set({browserNumber:request.number,wsUrl});
+      connectWebSocket();return {success:true};
+      } finally {maintenance=false;}
+    })().then(sendResponse).catch(e=>sendResponse({error:e.message}));
   } else if (request.action === 'testTrade') {
     enqueueOrder(request.data);
     sendResponse({success:true});
@@ -677,6 +777,7 @@ async function autoConnectFromStorage(reason) {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
+    await windowBinding.require();
     const stored = await WS_CONFIG.load();
     const url = stored.wsUrl || (stored.browserNumber ? buildWsUrl(stored.browserNumber) : null);
     if (!url) {
@@ -697,7 +798,8 @@ async function autoConnectFromStorage(reason) {
  */
 async function collectPageDiag(reason) {
   try {
-    const tabs = await chrome.tabs.query({ url: '*://*.binance.com/*' });
+    const binding = await windowBinding.require();
+    const tabs = await chrome.tabs.query({ windowId:binding.windowId, url: 'https://www.binance.com/*' });
     const tab = tabs.find(t => t.url && t.url.includes('/alpha')) || tabs[0];
     if (!tab || !tab.id) {
       console.log(`[diag:${reason}] 没有币安页面标签`);
