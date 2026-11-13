@@ -166,14 +166,12 @@ function extractAssetsPayload(bnData) {
 }
 
 /**
- * 获取当前浏览器编号（作为上报 body's name 字段）
+ * 获取当前账户编号（多个实例共用资产上报 name）
  */
 async function currentBrowserName() {
   try {
     const stored = await WS_CONFIG.load();
-    if (stored.browserNumber) return String(stored.browserNumber);
-    const m = /BINANCEALPHA-(\d+)/.exec(stored.wsUrl || '');
-    if (m) return m[1];
+    return WS_CONFIG.accountName(stored);
   } catch (e) {}
   return '';
 }
@@ -192,7 +190,9 @@ async function reportAssetsBalance(result) {
     return { ok: false, status: 0 };
   }
 
-  const body = { name: await currentBrowserName() };
+  const name = await currentBrowserName();
+  if (!name) return { ok: false, status: 0 };
+  const body = {};
   if (Array.isArray(inner)) {
     body.list = inner;
   } else {
@@ -202,6 +202,8 @@ async function reportAssetsBalance(result) {
     }
     if (!Array.isArray(body.list)) body.list = [];
   }
+
+  body.name = name; // Page payload must not override the configured account.
 
   try {
     const resp = await fetch(ALPHA_BALANCE_URL, {
@@ -761,7 +763,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       maintenance=true;
       try {
       await windowBinding.require();
-      if(!/^\d{1,12}$/.test(request.number || ''))throw Error('请输入1至12位数字编号');
       wsUrl=WS_CONFIG.buildUrl(request.number);
       await chrome.storage.local.set({browserNumber:request.number,wsUrl});
       connectWebSocket();return {success:true};

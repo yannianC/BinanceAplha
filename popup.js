@@ -23,13 +23,10 @@ document.addEventListener('DOMContentLoaded', () => {
   function connectWebSocket() {
     const number = browserNumberInput.value.trim();
     
-    if (!number) {
-      alert('请输入浏览器编号');
+    if (!WS_CONFIG.parseNumber(number)) {
+      alert('实例编号格式：23 或 23-1，每段1至12位数字');
       return;
     }
-    
-    // 拼接完整的WebSocket地址
-    const wsUrl = WS_CONFIG.buildUrl(number);
     
     chrome.runtime.sendMessage({
       action: 'connectWS',

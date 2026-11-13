@@ -9,7 +9,8 @@ function fixture(){
  tabs:{query:async q=>tabs.filter(t=>(q.windowId===undefined || t.windowId===q.windowId)&&(!q.url || t.url.startsWith('https://www.binance.com/'))),get:async id=>{const t=tabs.find(t=>t.id===id);if(!t)throw Error('closed');return t},create:async data=>{const t={id:next++,status:'complete',...data};tabs.push(t);return t},update:async(id,x)=>Object.assign(tabs.find(t=>t.id===id),x),remove:async id=>{const i=tabs.findIndex(t=>t.id===id);if(i>=0)tabs.splice(i,1)},onUpdated:event(),onRemoved:event(),reload:async()=>{throw Error('reload should not be reached')},sendMessage:async(id,m)=>{sent.push({id,m});return m.action==='activatePage'?{protocol:3,authorized:true}:{healthy:true,canTrade:true,url:tabs.find(t=>t.id===id).url}}},
  webRequest:{onBeforeSendHeaders:event()},alarms:{create(){},onAlarm:event()},notifications:{create(){}}};
  class WebSocket{static OPEN=1;static CONNECTING=0;static CLOSED=3;static CLOSING=2;constructor(url){this.url=url;this.readyState=0;}close(){}}
- const ctx=vm.createContext({chrome,AlphaTrade,AlphaWindow,AlphaAssets,WebSocket,URL,crypto:require('node:crypto').webcrypto,console:{log(){},warn(){},error(){}},importScripts(){},WS_CONFIG:{load:async()=>local,buildUrl:n=>'wss://example.test/'+n},setTimeout:()=>0,clearTimeout(){},setInterval:()=>0,clearInterval(){},out});
+ const ctx=vm.createContext({chrome,AlphaTrade,AlphaWindow,AlphaAssets,WebSocket,URL,crypto:require('node:crypto').webcrypto,console:{log(){},warn(){},error(){}},importScripts(){},setTimeout:()=>0,clearTimeout(){},setInterval:()=>0,clearInterval(){},out});
+ vm.runInContext(fs.readFileSync('ws-config.js','utf8'),ctx);
  vm.runInContext(fs.readFileSync('background.js','utf8'),ctx);
  vm.runInContext('ws={readyState:1,send:m=>out.push(JSON.parse(m)),close(){}};',ctx);
  const message=(request,sender={url:'chrome-extension://aaa/popup.html'})=>new Promise(resolve=>events.message(request,sender,resolve));
@@ -96,4 +97,30 @@ test('asset change during maintenance triggers automatic recheck when refresh re
  const f=await boundFixture();successfulTrades(f);await observe(f,'1');await f.ctx.enqueueOrder(trade('a'));
  f.ctx.chrome.tabs.reload=async id=>{await observe(f,'2');assert.equal(f.out.filter(m=>m.type==='isready').length,0);f.ctx.chrome.tabs.onUpdated.emit(id,{status:'complete'});};
  await f.ctx.handleWebSocketMessage({type:'ready',data:coin});await new Promise(r=>setImmediate(r));assert.equal(f.out.filter(m=>m.type==='isready').length,1);
+});
+
+for (const [instance,account] of [['23-1','23'],['23-2','23'],['23-3','23'],['22-1','22'],['22-2','22'],['23','23']]) {
+ test(`instance ${instance} connects independently and uploads assets as ${account}`,async()=>{
+  const f=await boundFixture(),uploads=[];
+  assert.equal((await f.message({action:'connectWS',number:instance})).success,true);
+  assert.equal(f.local.browserNumber,instance);
+  assert.equal(vm.runInContext('ws.url',f.ctx),`wss://sg.bicoin.com.cn/98a/weborder/BINANCEALPHA-${instance}`);
+  f.ctx.fetch=async(url,options)=>{uploads.push(JSON.parse(options.body));return {ok:true,status:200,text:async()=>''}};
+  await f.message({action:'alphaAssetsData',token:f.session.windowBinding.token,data:{data:{code:'000000',data:{list:[],name:'wrong'}}}},{tab:{id:90},frameId:0,url:f.tabs.at(-1).url});
+  assert.equal(uploads.length,1);assert.equal(uploads[0].name,account);
+ });
+}
+test('invalid instance identifiers cannot change saved connection',async()=>{
+ const f=await boundFixture();f.local.browserNumber='23-1';
+ for(const number of ['', '23-', '-1','23-1-2','23-a','23/1','23-1?x','23-1\n','1234567890123','23-1234567890123']){
+  assert((await f.message({action:'connectWS',number})).error,number);
+  assert.equal(f.local.browserNumber,'23-1');
+ }
+});
+test('legacy URL-only config derives account without truncating malformed identifiers',async()=>{
+ const f=fixture();
+ for(const [suffix,want] of [['23-1','23'],['22-2','22'],['23','23'],['23-bad',''],['23-1-2','']]){
+  f.local.wsUrl='wss://sg.bicoin.com.cn/98a/weborder/BINANCEALPHA-'+suffix;
+  assert.equal(await f.ctx.currentBrowserName(),want);
+ }
 });
