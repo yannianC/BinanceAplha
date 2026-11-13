@@ -3,6 +3,8 @@
  * 处理WebSocket连接和消息分发
  */
 
+importScripts('ws-config.js');
+
 let ws = null;
 let tradingTabId = null;
 let wsUrl = 'ws://localhost:8080'; // 默认WebSocket地址，后续可以配置
@@ -118,37 +120,112 @@ async function refreshAssets() {
 }
 
 /**
- * 通过 WebSocket 上报资产结果
+ * 资产上报接口地址（HTTP POST，不走 WebSocket）
  */
-function sendAssetsResult(assetsData, unionId, bnResp) {
-  const response = {
-    type: 'assetsResult',
-    data: {
-      assetsData: assetsData,
-      unionId: unionId,
-      bnResp: bnResp  // 0=插件自己构建的错误，1=币安返回
-    }
-  };
+const ALPHA_BALANCE_URL = WS_CONFIG.assetsUrl || 'https://sg.bicoin.com.cn/98h/sp/alphaBalance';
 
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(response));
-    console.log('已发送资产结果到WebSocket, unionId:', unionId);
-    return true;
-  } else {
-    console.warn('WebSocket未连接，资产结果未发送');
-    return false;
+/**
+ * 从币安资产响应中取出上报用的 data 体
+ * 币安 bapi 响应一般是 { code, message, data: {...} }，取内层 data
+ */
+function extractAssetsPayload(bnData) {
+  if (bnData && bnData.data && typeof bnData.data === 'object') {
+    return bnData.data;
   }
+  return null;
+}
+
+/**
+ * 获取当前浏览器编号（作为上报 body's name 字段）
+ */
+async function currentBrowserName() {
+  try {
+    const stored = await WS_CONFIG.load();
+    if (stored.browserNumber) return String(stored.browserNumber);
+    const m = /BINANCEALPHA-(\d+)/.exec(stored.wsUrl || '');
+    if (m) return m[1];
+  } catch (e) {}
+  return '';
+}
+
+/**
+ * 把资产结果 POST 到后端接口
+ * body: { name: "23", totalValuation: "...", list: [...] }
+ */
+async function reportAssetsBalance(result) {
+  const inner = extractAssetsPayload(result.data);
+  const hasPayload = Array.isArray(inner) ||
+    (inner && typeof inner === 'object' &&
+      ('list' in inner || 'assets' in inner || 'totalValuation' in inner));
+  if (!hasPayload) {
+    console.warn('资产响应结构异常，跳过接口上报:', JSON.stringify(result.data).slice(0, 300));
+    return { ok: false, status: 0 };
+  }
+
+  const body = { name: await currentBrowserName() };
+  if (Array.isArray(inner)) {
+    body.list = inner;
+  } else {
+    Object.assign(body, inner);
+    if (!Array.isArray(body.list) && Array.isArray(inner.assets)) {
+      body.list = inner.assets;
+    }
+    if (!Array.isArray(body.list)) body.list = [];
+  }
+
+  try {
+    const resp = await fetch(ALPHA_BALANCE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const text = await resp.text();
+    console.log(`资产已通过接口上报 HTTP ${resp.status}:`, text.slice(0, 300));
+    return { ok: resp.ok, status: resp.status };
+  } catch (e) {
+    console.error('资产接口上报失败:', e);
+    return { ok: false, status: 0 };
+  }
+}
+
+// 被动捕获上报的去重：相同内容60秒内只报一次
+let lastPassiveAssetsKey = '';
+let lastPassiveAssetsAt = 0;
+
+/**
+ * 页面自身拉取的资产数据 → POST 到后端接口
+ * （交易后币安前端自动刷新资产时被动捕获，无需重放查询）
+ */
+async function reportInterceptedAssets(msg) {
+  const result = { ok: true, status: 200, data: msg && msg.data };
+  try {
+    const payload = extractAssetsPayload(result.data);
+    if (!payload) {
+      console.warn('被动捕获的资产数据结构异常，跳过上报:', JSON.stringify(result.data).slice(0, 200));
+      return { ok: false, status: 0 };
+    }
+    const key = JSON.stringify(payload);
+    const now = Date.now();
+    if (key === lastPassiveAssetsKey && now - lastPassiveAssetsAt < 60000) {
+      console.log('资产数据与60秒内上次相同，跳过重复上报');
+      return { ok: true, status: 200, skipped: true };
+    }
+    lastPassiveAssetsKey = key;
+    lastPassiveAssetsAt = now;
+  } catch (e) {}
+  return reportAssetsBalance(result);
 }
 
 /**
  * 处理刷新资产请求（来自WS或popup测试）
+ * 查询币安资产后，通过 HTTP 接口上报（不再走 WebSocket）
  */
 async function handleRefreshAssets(unionId) {
   const result = await refreshAssets();
   if (result.ok) {
-    sendAssetsResult(result.data, unionId, 1);
+    result.report = await reportAssetsBalance(result);
   } else {
-    sendAssetsResult(result.data, unionId, 0);
+    console.warn('资产查询失败，跳过接口上报, HTTP', result.status);
   }
   return result;
 }
@@ -620,6 +697,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       notify('下单失败', ((od.code || '') + ' ' + (od.message || '')).slice(0, 100));
     }
 
+    // 币安下单成功后，延迟触发一次资产刷新上报（页面没自动刷新的兜底）
+    const orderSuccess = request.data.bnResp === 1 && (!od.code || String(od.code) === '000000');
+    if (orderSuccess) {
+      setTimeout(() => { handleRefreshAssets('after-trade'); }, 5000);
+    }
+
     sendResponse({ success: true });
   } else if (request.action === 'alphaHeadersCaptured') {
     // content.js 转发来的资产接口请求头（injected.js 捕获）
@@ -636,6 +719,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // popup 测试按钮：重放资产查询
     handleRefreshAssets('popup-test').then((result) => {
       sendResponse({ success: result.ok, status: result.status, data: result.data });
+    });
+    return true; // 异步响应
+  } else if (request.action === 'alphaAssetsData') {
+    // 页面拉取的资产数据（交易后币安前端自动刷新被动捕获）→ HTTP 上报
+    reportInterceptedAssets(request.data).then((r) => {
+      sendResponse({ success: r.ok, skipped: !!r.skipped });
     });
     return true; // 异步响应
   } else if (request.action === 'getCapturedHeadersInfo') {
@@ -693,7 +782,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
  * 根据浏览器编号拼接WS地址
  */
 function buildWsUrl(number) {
-  return 'wss://sg.bicoin.com.cn/98c/weborder/BINANCEALPHA-' + number;
+  return WS_CONFIG.buildUrl(number);
 }
 
 /**
@@ -705,7 +794,7 @@ async function autoConnectFromStorage(reason) {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
-    const stored = await chrome.storage.local.get(['browserNumber', 'wsUrl']);
+    const stored = await WS_CONFIG.load();
     const url = stored.wsUrl || (stored.browserNumber ? buildWsUrl(stored.browserNumber) : null);
     if (!url) {
       console.log(`[${reason}] 未保存浏览器编号，暂不自动连接（在popup里输入编号连接一次即可，之后全自动）`);
@@ -716,6 +805,59 @@ async function autoConnectFromStorage(reason) {
     connectWebSocket();
   } catch (e) {
     console.warn('自动连接失败:', e);
+  }
+}
+
+/**
+ * 收集币安Alpha页面DOM诊断（chrome.scripting在隔离世界执行，不改页面、无需刷新）
+ * 结果存 chrome.storage.local.pageDiag，便于远程排查下单选择器
+ */
+async function collectPageDiag(reason) {
+  try {
+    const tabs = await chrome.tabs.query({ url: '*://*.binance.com/*' });
+    const tab = tabs.find(t => t.url && t.url.includes('/alpha')) || tabs[0];
+    if (!tab || !tab.id) {
+      console.log(`[diag:${reason}] 没有币安页面标签`);
+      return;
+    }
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const vis = e => !!(e && e.offsetParent !== null);
+        const txt = e => (e && (e.textContent || '')).trim().slice(0, 50);
+        const cls = e => (e && (e.className || '')).toString().slice(0, 90);
+        return {
+          url: location.href,
+          buySellTabs: Array.from(document.querySelectorAll('.bn-tab__buySell')).map(e => ({
+            text: txt(e), cls: cls(e), active: e.classList.contains('active'), vis: vis(e)
+          })),
+          orderTabs: ['LIMIT', 'INSTANT', 'STOP_LIMIT'].map(id => {
+            const e = document.getElementById('bn-tab-' + id);
+            return e ? { id, text: txt(e), active: e.classList.contains('active'), vis: vis(e) } : null;
+          }).filter(Boolean),
+          buttons: Array.from(document.querySelectorAll('button[class*="bn-button"]')).filter(vis).map(e => ({
+            text: txt(e), cls: cls(e), disabled: !!e.disabled
+          })).slice(0, 40),
+          inputs: ['limitPrice', 'limitAmount', 'limitTotal'].map(id => {
+            const e = document.getElementById(id);
+            return e ? { id, vis: vis(e), value: e.value } : { id, missing: true };
+          }),
+          dialogs: Array.from(document.querySelectorAll(
+            '[role="dialog"], [class*="modal"], [class*="Modal"], [class*="dialog"], [class*="Dialog"]'
+          )).filter(vis).map(e => ({
+            cls: cls(e), text: txt(e),
+            buttons: Array.from(e.querySelectorAll('button')).map(b => txt(b)).slice(0, 10)
+          })).slice(0, 5)
+        };
+      }
+    });
+    if (res && res.result) {
+      const diag = { reason, at: Date.now(), ...res.result };
+      await chrome.storage.local.set({ pageDiag: diag });
+      console.log(`[diag:${reason}] 页面诊断已保存:`, diag.url);
+    }
+  } catch (e) {
+    console.warn(`[diag:${reason}] 收集失败:`, e.message);
   }
 }
 
@@ -754,7 +896,12 @@ chrome.runtime.onStartup.addListener(() => {
  * （service worker 被休眠唤醒时也靠它兜底恢复连接）
  */
 chrome.alarms.create('ws-watchdog', { periodInMinutes: 0.5 });
+chrome.alarms.create('page-diag', { periodInMinutes: 5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'page-diag') {
+    collectPageDiag('alarm');
+    return;
+  }
   if (alarm.name !== 'ws-watchdog') return;
   if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
     console.log('看门狗检测到WS未连接，尝试自动重连...');
@@ -766,4 +913,5 @@ chrome.alarms.onAlarm.addListener((alarm) => {
  * Service Worker 每次被唤醒/启动时，也尝试自动连接
  */
 autoConnectFromStorage('sw-start');
-
+// SW启动后延迟收集一次页面诊断（scripting直接读DOM，页面无需刷新）
+setTimeout(() => collectPageDiag('sw-start'), 15000);

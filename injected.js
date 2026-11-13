@@ -113,6 +113,15 @@
         }).catch(err => {
           console.error('解析Fetch响应失败:', err);
         });
+      } else if (shouldCaptureHeaders(url)) {
+        // 资产接口：捕获响应体（币安前端交易后自动刷新资产时被动拿到最新数据）
+        clonedResponse.json().then(data => {
+          window.postMessage({
+            type: 'ALPHA_ASSETS_DATA',
+            url: url,
+            data: data
+          }, '*');
+        }).catch(() => {});
       }
 
       return response;
@@ -151,10 +160,21 @@
   };
 
   XMLHttpRequest.prototype.send = function(...args) {
-    // 捕获请求头（资产接口）
+    // 捕获请求头 + 响应体（资产接口）
     if (this._url && shouldCaptureHeaders(this._url)) {
       try {
         captureRequestHeaders(this._url, this._method || 'GET', this._headers || {});
+
+        this.addEventListener('load', function() {
+          try {
+            const data = JSON.parse(this.responseText);
+            window.postMessage({
+              type: 'ALPHA_ASSETS_DATA',
+              url: this._url,
+              data: data
+            }, '*');
+          } catch (e) {}
+        });
       } catch (e) {}
     }
 

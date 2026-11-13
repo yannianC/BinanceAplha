@@ -15,7 +15,7 @@ document.addEventListener('DOMContentLoaded', () => {
   /**
    * 从存储中加载已保存的编号
    */
-  chrome.storage.local.get(['browserNumber'], (result) => {
+  WS_CONFIG.load().then((result) => {
     if (result.browserNumber) {
       browserNumberInput.value = result.browserNumber;
       
@@ -59,8 +59,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     
     // 拼接完整的WebSocket地址
-    const name = `BINANCEALPHA-${number}`;
-    const wsUrl = `wss://sg.bicoin.com.cn/98c/weborder/${name}`;
+    const wsUrl = WS_CONFIG.buildUrl(number);
     
     chrome.runtime.sendMessage({
       action: 'connectWS',
@@ -96,9 +95,9 @@ document.addEventListener('DOMContentLoaded', () => {
    * 创建交易标签页按钮点击事件
    */
   createTabBtn.addEventListener('click', () => {
-    chrome.tabs.create({ 
-      url: 'https://www.binance.com/zh-CN/trade',
-      active: false 
+    chrome.tabs.create({
+      url: 'https://www.binance.com/zh-CN/alpha',
+      active: false
     });
   });
 
@@ -193,4 +192,3 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     statusDiv.className = `status ${request.connected ? 'connected' : 'disconnected'}`;
   }
 });
-

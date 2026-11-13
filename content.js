@@ -60,6 +60,22 @@ window.addEventListener('message', (event) => {
     return;
   }
 
+  if (event.data.type === 'ALPHA_ASSETS_DATA') {
+    // 页面自身拉到的资产数据（交易后币安前端自动刷新），转发 background 上报
+    try {
+      chrome.runtime.sendMessage({
+        action: 'alphaAssetsData',
+        data: {
+          url: event.data.url,
+          data: event.data.data
+        }
+      });
+    } catch (error) {
+      console.warn('⚠️ 转发资产数据失败（可能插件已重新加载）:', error.message);
+    }
+    return;
+  }
+
   if (event.data.type === 'FETCH_RESPONSE') {
     console.log('====== 拦截到API响应 ======');
     console.log('URL:', event.data.url);
@@ -132,9 +148,12 @@ async function executeTradeOnPage(tradeInfo) {
     // 3. 检查并点击"我知道了"按钮（如果存在）
     await clickKnowItButton();
     
-    // 4. 点击买入或卖出标签
+    // 4. 点击买入或卖出标签（.bn-tab__buySell，页面上bn-tab-N有多组会重名）
     await clickTradeTab(direction);
-    
+
+    // 4.5 确保是"限价"下单类型（#bn-tab-LIMIT），否则价格/数量输入框不生效
+    await ensureLimitOrderTab();
+
     // 5. 等待一下让UI更新
     await sleep(500);
     
@@ -156,10 +175,10 @@ async function executeTradeOnPage(tradeInfo) {
     // 11. 再次检查并点击"我知道了"按钮（如果存在）
     await clickKnowItButton();
     
-    // 12. 点击对话框中的确认按钮
-    console.log('准备点击确认按钮，API拦截器应该已就绪');
+    // 12. 等待确认对话框：出现则点确认；6秒没有弹窗说明已直接提交，不报错（避免成功单被误报失败导致重复下单）
+    console.log('等待确认对话框（若有）...');
     await clickDialogConfirmButton();
-    
+
     console.log('交易操作执行完成，等待API响应...');
     return { status: 'success', message: '交易指令已提交' };
     
@@ -212,14 +231,43 @@ function waitForPageReady() {
 
 /**
  * 点击买入或卖出标签
+ * 注意：页面上 bn-tab-N id 有多组（行情筛选/买卖方向都用），
+ * 必须按 .bn-tab__buySell class + 文本定位，querySelector('#bn-tab-1') 会点到行情筛选页签
  * @param {string} direction - 买卖方向 "Buy" 或 "Sell"
  */
 async function clickTradeTab(direction) {
-  const tabId = direction === 'Buy' ? 'bn-tab-0' : 'bn-tab-1';
-  const tab = await waitForElement(`#${tabId}`, 10000);
-  
-  console.log(`点击${direction === 'Buy' ? '买入' : '卖出'}标签:`, tab);
+  const wantText = direction === 'Buy' ? '买入' : '卖出';
+
+  const findTab = () => {
+    const tabs = Array.from(document.querySelectorAll('.bn-tab__buySell'));
+    return tabs.find(t => (t.textContent || '').trim() === wantText)
+        || tabs[direction === 'Buy' ? 0 : 1];
+  };
+
+  let tab = findTab();
+  const deadline = Date.now() + 10000;
+  while (!tab && Date.now() < deadline) {
+    await sleep(300);
+    tab = findTab();
+  }
+  if (!tab) {
+    throw new Error(`未找到${wantText}标签（.bn-tab__buySell）`);
+  }
+
+  console.log(`点击${wantText}标签:`, (tab.textContent || '').trim());
   tab.click();
+}
+
+/**
+ * 确保当前是"限价"下单类型（页面上可能停留在即时/止盈止损）
+ */
+async function ensureLimitOrderTab() {
+  const limitTab = document.querySelector('#bn-tab-LIMIT');
+  if (limitTab && !limitTab.classList.contains('active')) {
+    console.log('当前不是限价单，切换到限价');
+    limitTab.click();
+    await sleep(300);
+  }
 }
 
 /**
@@ -258,32 +306,39 @@ async function setInputValue(inputId, value) {
  */
 async function clickSubmitButton(direction, coin) {
   const buttonClass = direction === 'Buy' ? 'bn-button__buy' : 'bn-button__sell';
-  
-  // 查找所有包含指定class的按钮
-  const buttons = document.querySelectorAll(`button[class*="${buttonClass}"]`);
-  
-  console.log(`查找包含class="${buttonClass}"的按钮，找到${buttons.length}个`);
-  
-  // 遍历按钮，查找包含币种的按钮
+  const dirText = direction === 'Buy' ? '买入' : '卖出';
+
+  // 查找所有包含指定class且未禁用的按钮
+  const buttons = Array.from(document.querySelectorAll(`button[class*="${buttonClass}"]`))
+    .filter(b => !b.disabled);
+
+  console.log(`查找class="${buttonClass}"的可用按钮，找到${buttons.length}个`);
+
+  const texts = [];
   for (const button of buttons) {
-    const buttonText = button.textContent || button.innerText;
-    console.log(`检查按钮文本: "${buttonText}"`);
-    
+    const buttonText = (button.textContent || button.innerText || '').trim();
+    texts.push(buttonText);
+
     if (buttonText.includes(coin)) {
       console.log(`找到匹配的按钮，准备点击: "${buttonText}"`);
-      
-      // 等待一小段时间确保所有值都已设置
       await sleep(200);
-      
-      // 点击按钮
       button.click();
-      
       console.log('按钮已点击');
       return;
     }
   }
-  
-  throw new Error(`未找到包含币种"${coin}"的${direction === 'Buy' ? '买入' : '卖出'}按钮`);
+
+  // 兜底：代币专属页通常只有一个买/卖按钮，币种文本没匹配上时直接点唯一可用按钮
+  const visible = buttons.filter(b => b.offsetParent !== null);
+  if (visible.length === 1) {
+    console.log(`未匹配到币种"${coin}"，使用唯一${dirText}按钮:`, (visible[0].textContent || '').trim());
+    await sleep(200);
+    visible[0].click();
+    console.log('按钮已点击（兜底）');
+    return;
+  }
+
+  throw new Error(`未找到包含币种"${coin}"的${dirText}按钮。候选按钮: ${texts.join(' | ') || '(无可用按钮)'}`);
 }
 
 /**
@@ -315,41 +370,38 @@ async function clickKnowItButton() {
 }
 
 /**
- * 点击确认对话框中的按钮（查找内容为"继续"的按钮）
+ * 等待并点击确认对话框中的按钮
+ * Alpha 下单可能没有二次确认弹窗：6秒内没等到就按"已直接提交"处理，返回 false
+ * @returns {Promise<boolean>} 是否点到了确认按钮
  */
 async function clickDialogConfirmButton() {
-  try {
-    // 等待一下确保按钮出现
-    await sleep(500);
-    
-    // 在整个页面中查找所有包含bn-button__primary的按钮
-    const buttons = document.querySelectorAll('button[class*="bn-button__primary"]');
-    
-    console.log(`查找包含"继续"的按钮，共找到${buttons.length}个primary按钮`);
-    
-    for (const button of buttons) {
-      const buttonText = (button.textContent || button.innerText).trim();
-      console.log(`检查按钮文本: "${buttonText}"`);
-      
-      if (buttonText === '继续') {
-        console.log('找到"继续"按钮，准备点击:', button);
-        
-        // 等待一小段时间确保按钮可点击
-        await sleep(300);
-        
-        // 点击按钮
-        button.click();
-        
-        console.log('"继续"按钮已点击');
-        return;
+  const deadline = Date.now() + 6000;
+  const confirmKeywords = ['继续', '确认', '确定', '买入', '卖出'];
+
+  while (Date.now() < deadline) {
+    try {
+      const dialogs = Array.from(document.querySelectorAll(
+        '[role="dialog"], [class*="modal"], [class*="Modal"], [class*="dialog"], [class*="Dialog"]'
+      )).filter(d => d.offsetParent !== null && d.offsetHeight > 0);
+
+      for (const dlg of dialogs) {
+        const allBtns = Array.from(dlg.querySelectorAll('button')).filter(b => !b.disabled);
+        // 优先点弹窗里的主按钮（币安确认钮常是"卖出 CT"这类带币种文案，精确匹配不可靠）
+        const btn = allBtns.find(b => (b.className || '').includes('bn-button__primary'))
+                 || allBtns.find(b => confirmKeywords.some(k => (b.textContent || '').includes(k)));
+        if (btn) {
+          console.log('找到确认对话框，点击:', (btn.textContent || '').trim(), '|', (btn.className || '').slice(0, 60));
+          await sleep(200);
+          btn.click();
+          return true;
+        }
       }
-    }
-    
-    throw new Error('未找到内容为"继续"的确认按钮');
-  } catch (error) {
-    console.error('点击确认对话框按钮失败:', error);
-    throw error;
+    } catch (e) {}
+    await sleep(300);
   }
+
+  console.log('6秒内未出现确认对话框，按已直接提交处理');
+  return false;
 }
 
 /**
