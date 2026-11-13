@@ -400,9 +400,12 @@ function sleep(ms) {
 async function checkPageReady() {
   await checkPageAuthority();
   const visible=e=>!!(e && e.offsetParent!==null);
-  const controls=['limitPrice','limitAmount'].every(id=>visible(document.getElementById(id)));
+  const inputs=['limitPrice','limitAmount'].map(id=>document.getElementById(id));
+  const controls=inputs.every(visible);
+  const editable=inputs.every(e=>e && !e.disabled && !e.readOnly);
   const buttons=Array.from(document.querySelectorAll('button[class*="bn-button__buy"],button[class*="bn-button__sell"]')).filter(visible);
   const loginRequired=buttons.some(b=>/登录|Log In|Sign In/i.test(b.textContent || ''));
   const healthy=document.readyState==='complete' && controls && buttons.length>0 && !loginRequired;
-  return {healthy,canTrade:healthy && !activeTrade && buttons.some(b=>!b.disabled),loginRequired,url:location.href,checkedAt:Date.now()};
+  // An empty order form normally disables submit; readiness means it can accept an order.
+  return {healthy,canTrade:healthy && editable && !activeTrade,loginRequired,url:location.href,checkedAt:Date.now()};
 }

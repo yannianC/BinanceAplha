@@ -470,16 +470,20 @@ function handleWebSocketMessage(message) {
     return;
   }
 
-  if (['checkTradeReady','refreshTradePage'].includes(message.type)) { handlePageCommand(message); return; }
+  if (['refresh','ready','checkTradeReady','refreshTradePage'].includes(message.type)) return handlePageCommand(message);
   if (message.type === 'order' && message.data) enqueueOrder(message.data);
 }
 
 async function handlePageCommand(message) {
+  // Server naming is intentional: refresh probes readiness; ready reloads the page.
+  const compact = message.type === 'refresh' || message.type === 'ready';
+  const reload = message.type === 'ready' || message.type === 'refreshTradePage';
+  const replySocket = ws;
   const {requestId,chainName,address}=message.data || {};
   const result={requestId,healthy:false,canTrade:false,checkedAt:Date.now(),instanceId:chrome.runtime.id};
   let locked=false;
   try {
-    if(typeof requestId!=='string' || !requestId || !/^[a-z0-9_-]+$/i.test(chainName || '') || !/^[a-z0-9_-]+$/i.test(address || '')) throw Error('无效检查参数');
+    if((!compact && (typeof requestId!=='string' || !requestId)) || !/^[a-z0-9_-]+$/i.test(chainName || '') || !/^[a-z0-9_-]+$/i.test(address || '')) throw Error('无效检查参数');
     if(isBusy())throw Error('BUSY: 正在下单或维护，不能检查切页或刷新');
     maintenance=true;locked=true;
     const binding=await windowBinding.require();
@@ -488,7 +492,7 @@ async function handlePageCommand(message) {
     if(!tab)throw Error('绑定窗口中没有该币种页面');
     await windowBinding.authorize(tab.id,binding.token);
     await chrome.tabs.update(tab.id,{active:true});
-    if(message.type==='refreshTradePage') {
+    if(reload) {
       await reloadBoundTab(tab.id,binding.token);
       result.refreshed=true;
     } else await waitForTabLoaded(tab.id);
@@ -503,7 +507,12 @@ async function handlePageCommand(message) {
   } catch(e){result.healthy=false;result.canTrade=false;result.error=e.message;}
   finally {if(locked)maintenance=false;}
   result.checkedAt=Date.now();
-  if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:message.type+'Result',data:result}));
+  if(replySocket === ws && replySocket?.readyState===WebSocket.OPEN) {
+    if(!compact) replySocket.send(JSON.stringify({type:message.type+'Result',data:result}));
+    else if(message.type==='refresh' && result.healthy && result.canTrade) replySocket.send(JSON.stringify({type:'isready'}));
+  }
+  // Compact protocol has no error/refresh acknowledgement; keep diagnostics local.
+  if(compact && result.error) console.warn('页面指令未就绪:',message.type,result.error);
   return result;
 }
 async function reloadBoundTab(tabId, token) {

@@ -122,7 +122,20 @@ WebSocket消息格式：
 响应type分别是checkTradeReadyResult、refreshTradePageResult。
 data包含原requestId、instanceId、checkedAt、healthy、canTrade、失败error；成功时含windowId及页面url。
 刷新确实完成时含refreshed:true；刷新成功不等于登录/表单已就绪，仍须检查healthy/canTrade。
-healthy检查页面加载、输入框、交易按钮和登录提示；canTrade还检查队列与当前按钮是否可用。
+healthy检查页面加载、输入框、交易按钮和登录提示；canTrade还检查队列与输入框是否可编辑。
 这是当前页面状态，不保证余额充足或币安必然接受下一单。下单仍重新检查窗口与币种。
 正在下单/接单/维护时，检查和刷新返回BUSY，不抢焦点、不刷新交易中的页面。
 检查不到目标币种页直接返回错误，不查找其他窗口。
+
+
+1.2.1 服务器确认的简化协议（注意指令名字与动作的对应）
+准备检查：{"type":"refresh","data":{"chainName":"bsc","address":"合约地址"}}
+只有实际页面healthy、canTrade及队列检查通过，才回复严格的 {"type":"isready"}，无data字段。
+无需requestId。不正常、忙碌、未绑定或未找到页面时不回复isready，服务器应自行超时处理。
+页面刷新：{"type":"ready","data":{"chainName":"bsc","address":"合约地址"}}
+只刷新本实例绑定窗口的指定币种页；不发刷新成功或失败的特殊WebSocket回包。
+刷新后的资产响应继续沿用原有捕获与HTTP资产上报（相同资产60秒内去重），不额外发资产WS回包。
+正在下单时不刷新；服务器可稍后再次检查/重发刷新。每实例建议一次只发一个准备检查，因为isready不含币种或请求编号。
+旧checkTradeReady/refreshTradePage接口保留兼容，服务器使用上面的简化协议即可。
+
+准备检查不要求空表单的买卖提交按钮已可点击；未填写价格数量时按钮禁用属正常。资金、数量及价格约束在实际下单时由页面/币安验证。

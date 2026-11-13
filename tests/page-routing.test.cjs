@@ -85,3 +85,8 @@ test('confirmation stops if receipt arrives during asynchronous authorization',a
  ctx.checkPageAuthority=()=>new Promise(r=>release=r);
  const click=ctx.authorizedClick({click:()=>clicks++});emit({type:'FETCH_RESPONSE',unionId:'x',data:{code:'000000'}});release();await click;assert.equal(clicks,0);
 });
+test('empty editable form is ready even while submit is disabled; locked inputs are not',async()=>{
+ const {ctx}=pageFixture();const price={offsetParent:{},disabled:false,readOnly:false},amount={...price};
+ ctx.document={readyState:'complete',getElementById:id=>id==='limitPrice'?price:amount,querySelectorAll:()=>[{offsetParent:{},disabled:true,textContent:'买入 AAA'}]};
+ assert.equal((await ctx.checkPageReady()).canTrade,true);amount.disabled=true;assert.equal((await ctx.checkPageReady()).canTrade,false);
+});
