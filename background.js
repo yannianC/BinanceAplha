@@ -508,6 +508,11 @@ function handleWebSocketMessage(message) {
   if (message.type === 'order' && message.data) enqueueOrder(message.data);
 }
 
+let pageCommandSequence=0;
+function recordPageCommand(sequence,diagnostic) {
+  if(sequence!==pageCommandSequence)return;
+  void chrome.storage.local.set({pageCommandDiag:diagnostic}).catch(()=>{});
+}
 async function handlePageCommand(message, expected = null) {
   // refresh reloads and checks; ready only checks. Both acknowledge verified readiness.
   const compact = message.type === 'refresh' || message.type === 'ready';
@@ -515,7 +520,10 @@ async function handlePageCommand(message, expected = null) {
   const replySocket = ws;
   const {requestId,chainName,address}=message.data || {};
   const result={requestId,healthy:false,canTrade:false,checkedAt:Date.now(),instanceId:chrome.runtime.id};
-  let locked=false,checkedBindingToken=null;
+  const sequence=expected?0:++pageCommandSequence;
+  const diagnostic={type:message.type,chainName:String(chainName || '').slice(0,80),address:String(address || '').slice(0,160),at:Date.now(),checking:true,isreadySent:false};
+  if(!expected)recordPageCommand(sequence,diagnostic);
+  let locked=false,checkedBindingToken=null,isreadySent=false;
   try {
     if((!compact && (typeof requestId!=='string' || !requestId)) || !/^[a-z0-9_-]+$/i.test(chainName || '') || !/^[a-z0-9_-]+$/i.test(address || '')) throw Error('无效检查参数');
     if(isBusy())throw Error('BUSY: 正在下单或维护，不能检查切页或刷新');
@@ -524,18 +532,15 @@ async function handlePageCommand(message, expected = null) {
     checkedBindingToken=binding.token;
     if(expected && (binding.token!==expected.bindingToken || ws!==expected.socket))throw Error('窗口或连接已变化');
     const url=`https://www.binance.com/zh-CN/alpha/${chainName}/${address}`;
-    const tab=await findTabByUrl(url);
+    const existing=await findTabByUrl(url);
+    const tab=existing || (compact && !expected ? await getOrCreateTradingTab(url) : null);
     if(!tab)throw Error('绑定窗口中没有该币种页面');
     await windowBinding.authorize(tab.id,binding.token);
     await chrome.tabs.update(tab.id,{active:true});
-    if(reload) {
-      await reloadBoundTab(tab.id,binding.token);
-      result.refreshed=true;
-    } else await waitForTabLoaded(tab.id);
-    await windowBinding.authorize(tab.id,binding.token);
-    await ensureContentScriptLoaded(tab.id);
-    const page=await withTimeout(chrome.tabs.sendMessage(tab.id,{action:'checkReady'}),5000);
-    if(AlphaTrade.assetKey(page?.url)!==AlphaTrade.assetKey(url))throw Error('币种已变化');
+    if(reload && existing)await reloadBoundTab(tab.id,binding.token);
+    else await waitForTabLoaded(tab.id);
+    if(reload)result.refreshed=true;
+    const page=await waitForReadyPage(tab.id,url,binding.token,replySocket,!reload && !expected);
     Object.assign(result,page);
     result.windowId=binding.windowId;
   } catch(e){result.healthy=false;result.canTrade=false;result.error=e.message;}
@@ -545,17 +550,53 @@ async function handlePageCommand(message, expected = null) {
     if(!compact) replySocket.send(JSON.stringify({type:message.type+'Result',data:result}));
     else if(result.healthy && result.canTrade) {
       replySocket.send(JSON.stringify({type:'isready'}));
+      isreadySent=true;
       // This check also satisfies a pending post-trade check for the same page.
       const ticket=assetReadiness.pending;
       if(ticket && ticket.trade.socket===replySocket && ticket.trade.bindingToken===checkedBindingToken &&
           AlphaTrade.assetKey(ticket.trade.url)===AlphaTrade.assetKey(result.url)) assetReadiness.acknowledge(ticket);
     }
   }
+  if(!expected)recordPageCommand(sequence,{...diagnostic,at:Date.now(),checking:false,isreadySent,
+    healthy:result.healthy,canTrade:result.canTrade,windowId:result.windowId,url:result.url,
+    reason:result.error || (!result.healthy || !result.canTrade ? '交易页面未就绪' : !isreadySent && compact ? 'WebSocket连接已变化或断开' : '')});
   if(locked)void assetReadiness.flush();
   // Compact protocol only acknowledges readiness; keep failures local.
   if(compact && result.error) console.warn('页面指令未就绪:',message.type,result.error);
   return result;
 }
+async function waitForReadyPage(tabId,url,token,socket,allowRecovery) {
+  let deadline=Date.now()+15000,recovered=false,lastError=Error('交易表单尚未加载');
+  async function validateContext() {
+    if(ws!==socket || socket?.readyState!==WebSocket.OPEN)throw Error('WebSocket连接已变化或断开');
+    await windowBinding.authorize(tabId,token);
+    const current=await chrome.tabs.get(tabId);
+    if(AlphaTrade.assetKey(current.pendingUrl || current.url)!==AlphaTrade.assetKey(url))throw Error('目标币种页已变化');
+  }
+  for(let attempt=0;attempt<60 && Date.now()<deadline;attempt++) {
+    await validateContext();
+    try {await withTimeout(ensureContentScriptLoaded(tabId),3000);}
+    catch(e) {
+      lastError=e;
+      if(allowRecovery && !recovered) {
+        recovered=true;await validateContext();await reloadBoundTab(tabId,token);deadline=Date.now()+15000;
+        continue;
+      }
+      await sleep(250);continue;
+    }
+    let page;
+    try {page=await withTimeout(chrome.tabs.sendMessage(tabId,{action:'checkReady'}),3000);}
+    catch(e){lastError=e;await sleep(250);continue;}
+    await validateContext();
+    if(AlphaTrade.assetKey(page?.url)!==AlphaTrade.assetKey(url))throw Error('检查回执的币种不匹配');
+    if(page.healthy && page.canTrade)return page;
+    if(page.loginRequired)throw Error('币安页面需要登录');
+    lastError=Error(page.error || (page.healthy?'交易表单不可编辑或页面正在操作':'交易表单尚未加载'));
+    await sleep(250);
+  }
+  throw lastError;
+}
+
 async function reloadBoundTab(tabId, token) {
   await windowBinding.authorize(tabId,token);
   let listener,removed;

@@ -199,3 +199,17 @@ document.addEventListener('DOMContentLoaded',async()=>{
   });
   await showBinding();
 });
+
+
+document.addEventListener('DOMContentLoaded',()=>{
+  const info=document.getElementById('readinessInfo');
+  async function showReadiness(){
+    try {
+      const {pageCommandDiag:d}=await chrome.storage.local.get('pageCommandDiag');
+      if(!d){info.textContent='最近就绪检查：暂无记录';return;}
+      const state=d.checking?'正在切换币种并检查':d.isreadySent?'已回复 isready':`未回复：${d.reason || '页面未就绪'}`;
+      info.textContent=`${new Date(d.at).toLocaleTimeString()} ${d.type} · ${d.address?.slice(-8) || ''}：${state}`;
+    }catch(_){info.textContent='最近就绪检查：读取失败';}
+  }
+  void showReadiness();setInterval(showReadiness,2000);
+});

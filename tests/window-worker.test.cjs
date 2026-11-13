@@ -13,6 +13,7 @@ function fixture(){
  vm.runInContext(fs.readFileSync('ws-config.js','utf8'),ctx);
  vm.runInContext(fs.readFileSync('background.js','utf8'),ctx);
  vm.runInContext('ws={readyState:1,send:m=>out.push(JSON.parse(m)),close(){}};',ctx);
+ let now=Date.now();ctx.Date=class extends Date {static now(){return now}};ctx.sleep=async ms=>{now+=ms};
  const message=(request,sender={url:'chrome-extension://aaa/popup.html'})=>new Promise(resolve=>events.message(request,sender,resolve));
  return {ctx,tabs,local,session,out,sent,message,hook:f=>saveHook=f};
 }
@@ -151,4 +152,44 @@ test('refresh cannot acknowledge on a replacement socket',async()=>{
  const f=await boundFixture();
  f.ctx.chrome.tabs.reload=async id=>{vm.runInContext('ws={readyState:1,send:m=>out.push(JSON.parse(m))};',f.ctx);f.ctx.chrome.tabs.onUpdated.emit(id,{status:'complete'});};
  await f.ctx.handleWebSocketMessage({type:'refresh',data:coin});assert.equal(f.out.length,0);
+});
+
+test('ready opens missing coin in its own window then reuses it on the next request',async()=>{
+ const f=await boundFixture();const target={chainName:'bsc',address:'0xbbb'};
+ f.tabs.push({id:99,windowId:2,url:'https://www.binance.com/en/alpha/bsc/0xbbb',status:'complete'});
+ await f.ctx.handleWebSocketMessage({type:'ready',data:target});
+ const local=f.tabs.filter(t=>t.windowId===1 && t.url.includes('/0xbbb'));assert.equal(local.length,1);assert.equal(local[0].active,true);assert(f.sent.every(m=>m.id===local[0].id));assert.equal(f.out.at(-1).type,'isready');
+ await f.ctx.handleWebSocketMessage({type:'ready',data:target});assert.equal(f.tabs.filter(t=>t.windowId===1 && t.url.includes('/0xbbb')).length,1);
+});
+test('ready waits for SPA form after document complete before reporting ready',async()=>{
+ const f=await boundFixture();let checks=0;
+ f.ctx.chrome.tabs.sendMessage=async(_,m)=>m.action==='activatePage'?{protocol:4,authorized:true}:{healthy:++checks>=3,canTrade:checks>=3,url:f.tabs.at(-1).url};
+ await f.ctx.handleWebSocketMessage({type:'ready',data:coin});assert.equal(checks,3);assert.equal(f.out.at(-1).type,'isready');
+});
+test('ready recovers a missing content receiver with one bound page reload',async()=>{
+ const f=await boundFixture();let reloads=0;const original=f.ctx.chrome.tabs.sendMessage;
+ f.ctx.chrome.tabs.sendMessage=async(id,m)=>{if(!reloads)throw Error('Could not establish connection. Receiving end does not exist.');return original(id,m)};
+ f.ctx.chrome.tabs.reload=async id=>{reloads++;f.ctx.chrome.tabs.onUpdated.emit(id,{status:'complete'});};
+ await f.ctx.handleWebSocketMessage({type:'ready',data:coin});assert.equal(reloads,1);assert.equal(f.out.at(-1).type,'isready');
+});
+test('unready outcome and busy refusal leave an inspectable local reason',async()=>{
+ const f=await boundFixture();vm.runInContext('acceptingOrders=1;',f.ctx);
+ await f.ctx.handleWebSocketMessage({type:'ready',data:coin});await new Promise(r=>setImmediate(r));assert.equal(f.local.pageCommandDiag.isreadySent,false);assert.match(f.local.pageCommandDiag.reason,/BUSY/);
+});
+
+test('refresh opens a missing target without reloading a different coin',async()=>{
+ const f=await boundFixture();await f.ctx.handleWebSocketMessage({type:'refresh',data:{chainName:'bsc',address:'0xccc'}});
+ assert.equal(f.tabs.find(t=>t.id===90).url.includes(coin.address),true);assert.equal(f.out.at(-1).type,'isready');
+ await new Promise(r=>setImmediate(r));assert.equal(f.local.pageCommandDiag.isreadySent,true);assert.equal(f.local.pageCommandDiag.address,'0xccc');
+});
+test('permanent missing script recovers at most once and records failure',async()=>{
+ const f=await boundFixture();let reloads=0;
+ f.ctx.chrome.tabs.sendMessage=async()=>{throw Error('Receiving end does not exist')};f.ctx.chrome.tabs.reload=async id=>{reloads++;f.ctx.chrome.tabs.onUpdated.emit(id,{status:'complete'});};
+ await f.ctx.handleWebSocketMessage({type:'ready',data:coin});await new Promise(r=>setImmediate(r));
+ assert.equal(reloads,1);assert.equal(f.out.length,0);assert.match(f.local.pageCommandDiag.reason,/Receiving end/);
+});
+test('closing window marker during readiness check prevents positive reply',async()=>{
+ const f=await boundFixture(),original=f.ctx.chrome.tabs.sendMessage;
+ f.ctx.chrome.tabs.sendMessage=async(id,m)=>{const result=await original(id,m);if(m.action==='checkReady')await f.ctx.chrome.tabs.remove(f.session.windowBinding.markerId);return result};
+ await f.ctx.handleWebSocketMessage({type:'ready',data:coin});assert.equal(f.out.length,0);
 });
