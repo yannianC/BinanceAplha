@@ -38,7 +38,7 @@ async function activatePage() {
   });
   await injectionPromise;
   bridgePost({type:'ALPHA_ENABLE'});
-  return {protocol:5,authorized:true};
+  return {protocol:6,authorized:true};
 }
 // Unbound copies remain inert and do not install page-world interceptors.
 activatePage().catch(()=>{});
@@ -123,18 +123,18 @@ window.addEventListener('message', (event) => {
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'activatePage') {
-    activatePage().then(sendResponse).catch(e=>sendResponse({protocol:5,authorized:false,error:e.message}));return true;
+    activatePage().then(sendResponse).catch(e=>sendResponse({protocol:6,authorized:false,error:e.message}));return true;
   }
   if (request.action === 'checkReady') {
     checkPageReady().then(sendResponse).catch(e=>sendResponse({healthy:false,canTrade:false,error:e.message}));return true;
   }
   if (request.action === 'ping') {
     // 响应ping消息，表示content script已就绪
-    sendResponse({ success: true, ready: true, protocol:5 });
+    sendResponse({ success: true, ready: true, protocol:6 });
     return true;
   } else if (request.action === 'executeTrade') {
     executeTradeOnPage(request.data)
-      .then(data => sendResponse({ protocol:5, data }))
+      .then(data => sendResponse({ protocol:6, data }))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true; // 保持消息通道打开
   }
@@ -438,7 +438,13 @@ async function clickDialogConfirmButton(trade, checkAsset) {
           await sleep(200);
           if (trade.receipt) return false;
           checkAsset();
-          await authorizedClick(btn);
+          const clicked=await authorizedClick(btn,()=>{
+            if(btn.isConnected===false || btn.disabled || btn.offsetParent===null)throw Error('确认按钮已不可用');
+          });
+          if(!clicked)return false;
+          // Notify immediately after the click; receipt/asset reporting remains independent.
+          try {await chrome.runtime.sendMessage({action:'orderConfirmClicked',token:trade.token,attemptId:trade.id});}
+          catch(e){console.warn('确认点击就绪通知失败:',e.message);}
           return true;
         }
       }

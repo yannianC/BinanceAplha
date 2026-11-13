@@ -11,11 +11,11 @@ function routing(tabs) {
   query:async q=>tabs.filter(t=>t.windowId===q.windowId),create:async t=>{const tab={...t,id:tabs.length+1,status:'complete'};tabs.push(tab);created.push(tab);return tab},
   get:async id=>{const tab=tabs.find(t=>t.id===id);if(!tab)throw Error('closed');return tab},
   update:async(id,values)=>{const tab=tabs.find(t=>t.id===id);Object.assign(tab,values);return tab},
-  sendMessage:async(id,msg)=>msg.action==='activatePage'?{protocol:5,authorized:true}:(sent.push({id,msg}),{protocol:5,data:{unionId:msg.data.unionId,bnResp:1,orderData:{code:'000000'}}})
+  sendMessage:async(id,msg)=>msg.action==='activatePage'?{protocol:6,authorized:true}:(sent.push({id,msg}),{protocol:6,data:{unionId:msg.data.unionId,bnResp:1,orderData:{code:'000000'}}})
  }};
  const windowBinding={require:async()=>({windowId:1,token:"t"}),authorize:async id=>{if((await chrome.tabs.get(id)).windowId!==1)throw Error("wrong window")}};
  const ctx=vm.createContext({chrome,windowBinding,AlphaTrade,console:silent,setTimeout,clearTimeout,Date,URL,crypto:require('node:crypto').webcrypto});
- vm.runInContext('let tradingTabId;const ws=null;const assetReadiness={begin:()=>({}),finish(){}};'+source.slice(source.indexOf('async function executeTrade(tradeInfo)'),source.indexOf('/**\n * 监听来自content script')),ctx);
+ vm.runInContext('let tradingTabId,activeDispatch=null;const ws=null;'+source.slice(source.indexOf('async function executeTrade(tradeInfo)'),source.indexOf('/**\n * 监听来自content script')),ctx);
  return {ctx,sent,created};
 }
 test('A B A reuses pages across locales, creates missing B without closing A',async()=>{
@@ -205,5 +205,18 @@ test('render wait uses timer fallback in hidden pages and cancels unused callbac
   const ctx=vm.createContext({requestAnimationFrame:cb=>{frame=cb;return 1},cancelAnimationFrame:id=>{cancelled=id===1},setTimeout:cb=>{timer=cb;return 2},clearTimeout:id=>{cleared=id===2}});
   vm.runInContext(text.slice(text.indexOf('function waitForFormUpdate'),text.indexOf('function normalizedFormNumber')),ctx);
   const wait=ctx.waitForFormUpdate();(winner==='frame'?frame:timer)();await wait;assert(cleared);assert(cancelled);
+ }
+});
+
+test('confirmation announces only after an actual successful click',async()=>{
+ for(const mode of ['clicked','skipped','throw','disabled']) {
+  const {ctx}=pageFixture();const sent=[];let clicks=0;
+  const btn={offsetParent:{},offsetHeight:20,isConnected:true,disabled:false,className:'bn-button__primary',textContent:'确认',click(){clicks++;if(mode==='throw')throw Error('click failed')}};
+  ctx.document={querySelectorAll:()=>[{offsetParent:{},offsetHeight:20,querySelectorAll:()=>[btn]}]};
+  let now=0;ctx.Date={now:()=>now};ctx.sleep=async ms=>{now+=ms};ctx.chrome.runtime.sendMessage=async m=>{sent.push(m);return {sent:true}};
+  ctx.authorizedClick=async(element,before)=>{if(mode==='skipped')return false;if(mode==='disabled')element.disabled=true;before();element.click();return true};
+  await ctx.clickDialogConfirmButton({id:'attempt',token:'t'},()=>{});
+  assert.equal(sent.filter(m=>m.action==='orderConfirmClicked').length,mode==='clicked'?1:0,mode);
+  if(mode==='clicked')assert.equal(clicks,1);
  }
 });
