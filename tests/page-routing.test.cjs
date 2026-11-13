@@ -11,10 +11,10 @@ function routing(tabs) {
   query:async q=>tabs.filter(t=>t.windowId===q.windowId),create:async t=>{const tab={...t,id:tabs.length+1,status:'complete'};tabs.push(tab);created.push(tab);return tab},
   get:async id=>{const tab=tabs.find(t=>t.id===id);if(!tab)throw Error('closed');return tab},
   update:async(id,values)=>{const tab=tabs.find(t=>t.id===id);Object.assign(tab,values);return tab},
-  sendMessage:async(id,msg)=>msg.action==='activatePage'?{protocol:3,authorized:true}:(sent.push({id,msg}),{protocol:3,data:{unionId:msg.data.unionId,bnResp:1,orderData:{code:'000000'}}})
+  sendMessage:async(id,msg)=>msg.action==='activatePage'?{protocol:4,authorized:true}:(sent.push({id,msg}),{protocol:4,data:{unionId:msg.data.unionId,bnResp:1,orderData:{code:'000000'}}})
  }};
  const windowBinding={require:async()=>({windowId:1,token:"t"}),authorize:async id=>{if((await chrome.tabs.get(id)).windowId!==1)throw Error("wrong window")}};
- const ctx=vm.createContext({chrome,windowBinding,AlphaTrade,console:silent,setTimeout,clearTimeout,Date,URL});
+ const ctx=vm.createContext({chrome,windowBinding,AlphaTrade,console:silent,setTimeout,clearTimeout,Date,URL,crypto:require('node:crypto').webcrypto});
  vm.runInContext('let tradingTabId;const ws=null;const assetReadiness={begin:()=>({}),finish(){}};'+source.slice(source.indexOf('async function executeTrade(tradeInfo)'),source.indexOf('/**\n * 监听来自content script')),ctx);
  return {ctx,sent,created};
 }
@@ -52,7 +52,7 @@ function pageFixture(){
  const ctx=vm.createContext({window,AlphaTrade,location:{href:'https://www.binance.com/en/alpha/bsc/0xaaa'},chrome:{runtime:{id:'a',sendMessage:async()=>({authorized:true,token:'t'}),onMessage:{addListener(){}}}},console:silent,Date,setTimeout,clearTimeout});
  vm.runInContext(fs.readFileSync('content.js','utf8'),ctx);
  vm.runInContext("pageBinding='t';injectionPromise=Promise.resolve();",ctx);
- vm.runInContext('sleep=async()=>{};waitForPageReady=async()=>{};clickKnowItButton=async()=>{};clickTradeTab=async()=>{};ensureLimitOrderTab=async()=>{};setInputValue=async()=>{};',ctx);
+ vm.runInContext('sleep=async()=>{};waitForPageReady=async()=>{};clickKnowItButton=async()=>{};clickTradeTab=async()=>{};ensureLimitOrderTab=async()=>{};setInputValue=async()=>{};waitForOrderForm=async()=>{};assertOrderForm=()=>{};captureOrderForm=()=>({});',ctx);
  return {ctx,emit:data=>listener({source:window,data:{instanceId:'a',token:'t',...data}})};
 }
 test('expired order cannot click submit',async()=>{
@@ -74,14 +74,14 @@ test('routing never reuses another window even for identical coin',async()=>{
 });
 test('final click rejects SPA navigation during asynchronous authorization',async()=>{
  const {ctx}=pageFixture();let release,clicks=0;
- vm.runInContext("activeTrade={id:'x',url:location.href,token:'t',deadline:Date.now()+80000};",ctx);
+ vm.runInContext("activeTrade={id:'x',unionId:'x',url:location.href,token:'t',deadline:Date.now()+80000};",ctx);
  ctx.checkPageAuthority=()=>new Promise(r=>release=r);
  const click=ctx.authorizedClick({click:()=>clicks++});ctx.location.href='https://www.binance.com/en/alpha/bsc/0xbbb';release();
  await assert.rejects(click);assert.equal(clicks,0);
 });
 test('confirmation stops if receipt arrives during asynchronous authorization',async()=>{
  const {ctx,emit}=pageFixture();let release,clicks=0;
- vm.runInContext("activeTrade={id:'x',url:location.href,token:'t',deadline:Date.now()+80000};",ctx);
+ vm.runInContext("activeTrade={id:'x',unionId:'x',url:location.href,token:'t',deadline:Date.now()+80000};",ctx);
  ctx.checkPageAuthority=()=>new Promise(r=>release=r);
  const click=ctx.authorizedClick({click:()=>clicks++});emit({type:'FETCH_RESPONSE',unionId:'x',data:{code:'000000'}});release();await click;assert.equal(clicks,0);
 });
@@ -89,4 +89,35 @@ test('empty editable form is ready even while submit is disabled; locked inputs 
  const {ctx}=pageFixture();const price={offsetParent:{},disabled:false,readOnly:false},amount={...price};
  ctx.document={readyState:'complete',getElementById:id=>id==='limitPrice'?price:amount,querySelectorAll:()=>[{offsetParent:{},disabled:true,textContent:'买入 AAA'}]};
  assert.equal((await ctx.checkPageReady()).canTrade,true);amount.disabled=true;assert.equal((await ctx.checkPageReady()).canTrade,false);
+});
+
+test('input setter updates tracked form state, not only displayed DOM value',async()=>{
+ class Input {get value(){return this.raw || ''}set value(v){this.raw=String(v)}focus(){}blur(){}dispatchEvent(){if(this.raw!==this.tracked){this.model=this.raw;this.tracked=this.raw}}}
+ const input=new Input();input.value='1234';input.tracked='1234';input.model='1234';
+ Object.defineProperty(input,'value',{get(){return this.raw},set(v){this.raw=String(v);this.tracked=String(v)}});
+ const text=fs.readFileSync('content.js','utf8');const start=text.indexOf('async function setInputValue('),end=text.indexOf('async function clickSubmitButton(',start);
+ const ctx=vm.createContext({HTMLInputElement:Input,Event:class{constructor(type){this.type=type}},console:silent,waitForElement:async()=>input,sleep:async()=>{}});vm.runInContext(text.slice(start,end),ctx);
+ await ctx.setInputValue('limitAmount','945');assert.equal(input.value,'945');assert.equal(input.model,'945');
+});
+
+test('same unionId retry ignores previous attempt response and keeps server ID in result',async()=>{
+ const {ctx,emit}=pageFixture();
+ ctx.clickSubmitButton=async(_,__,before)=>{before();emit({type:'FETCH_RESPONSE',unionId:'attempt-old',data:{code:'OLD'}});emit({type:'FETCH_RESPONSE',unionId:'attempt-new',data:{code:'000000'}})};
+ ctx.clickDialogConfirmButton=async()=>{};
+ const r=await ctx.executeTradeOnPage({bindingToken:'t',url:ctx.location.href,unionId:'same-server-id',attemptId:'attempt-new',deadline:Date.now()+80000});
+ assert.equal(r.unionId,'same-server-id');assert.equal(r.orderData.code,'000000');
+});
+test('submit check rejects mismatched direction and values; error captures balance evidence',()=>{
+ const s=fs.readFileSync('content.js','utf8');const ctx=vm.createContext({Date});vm.runInContext(s.slice(s.indexOf('function normalizedFormNumber'),s.indexOf('async function clickSubmitButton')),ctx);
+ const inputs={limitPrice:{value:'0.051732230'},limitAmount:{value:'945.00'},limitTotal:{value:'48.89'},'bn-tab-LIMIT':{classList:{contains:()=>true}}};
+ let direction='卖出';ctx.document={getElementById:id=>inputs[id],querySelectorAll:()=>[{textContent:'买入',classList:{contains:()=>direction==='买入'}},{textContent:'卖出',classList:{contains:()=>direction==='卖出'}}],body:{innerText:'可用\n1000 AGT\n余额不足'}};
+ ctx.assertOrderForm('Sell','0.05173223','945');inputs.limitAmount.value='1234';assert.throws(()=>ctx.assertOrderForm('Sell','0.05173223','945'));inputs.limitAmount.value='945';direction='买入';assert.throws(()=>ctx.assertOrderForm('Sell','0.05173223','945'));
+ const r=ctx.attachOrderDiagnostics({orderData:{code:'ORDER_STATUS_UNKNOWN'}},{});assert.equal(r.orderData.pageDiagnostics.after.values.limitAmount,'945');assert(r.orderData.pageDiagnostics.after.balanceHints.some(t=>t.includes('余额不足')));
+});
+
+test('form direction guard supports visible English Buy/Sell tabs',()=>{
+ const s=fs.readFileSync('content.js','utf8');const ctx=vm.createContext({Date});vm.runInContext(s.slice(s.indexOf('function normalizedFormNumber'),s.indexOf('async function clickSubmitButton')),ctx);
+ let active='Sell';const tabs=['Buy','Sell'].map(text=>({textContent:text,offsetParent:{},classList:{contains:()=>active===text}}));
+ ctx.document={querySelectorAll:()=>[{textContent:'卖出',offsetParent:null,classList:{contains:()=>true}},...tabs],getElementById:id=>id==='bn-tab-LIMIT'?{classList:{contains:()=>true}}:{value:id==='limitPrice'?'1':'945'}};
+ ctx.assertOrderForm('Sell','1','945');assert.throws(()=>ctx.assertOrderForm('Buy','1','945'));active='Buy';ctx.assertOrderForm('Buy','1','945');assert.throws(()=>ctx.assertOrderForm('Sell','1','945'));
 });

@@ -6,13 +6,13 @@ for(const label of ['A','B'])require('node:child_process').execFileSync(process.
 (async()=>{
  const context=await chromium.launchPersistentContext(path.join(runRoot,'profile'),{headless:true,executablePath:process.env.CHROMIUM_EXECUTABLE || chromium.executablePath(),args:['--host-resolver-rules=MAP www.binance.com 127.0.0.1',`--disable-extensions-except=${runRoot}/A,${runRoot}/B`,`--load-extension=${runRoot}/A,${runRoot}/B`]});
  try {
- const actualOrders=[];
+ const actualOrders=[];let rejectNext=false;
  await context.route('**/*',async route=>{
   const url=route.request().url();
   if(url.startsWith('chrome-extension:')){await route.continue();return;}
   if(url.includes('/cloud-wallet/alpha')){await route.fulfill({json:{code:'000000',data:{list:[{chainId:'56',contractAddress:'0xaaa',free:String(100-actualOrders.length),freeze:'0'}]}}});return;}
-  if(url.includes('/alpha-trade/order/place')){actualOrders.push({url,body:route.request().postData()});await route.fulfill({json:{code:'000000',data:{orderId:'mock'}}});return;}
-  if(url.startsWith('https://www.binance.com/en/alpha/')){await route.fulfill({contentType:'text/html; charset=utf-8',body:`<!doctype html><html><body><button class="bn-tab__buySell">买入</button><button class="bn-tab__buySell">卖出</button><button id="bn-tab-LIMIT" class="active">限价</button><input id="limitPrice"><input id="limitAmount"><button class="bn-button__buy" onclick="fetch('/bapi/asset/v1/private/alpha-trade/order/place',{method:'POST',body:JSON.stringify({price:document.getElementById('limitPrice').value,amount:document.getElementById('limitAmount').value})}).then(()=>fetch('/bapi/defi/v1/private/wallet-direct/cloud-wallet/alpha'))">买入 AAA</button></body></html>`});return;}
+  if(url.includes('/alpha-trade/order/place')){actualOrders.push({url,body:route.request().postData()});const code=rejectNext?'INSUFFICIENT_BALANCE':'000000';rejectNext=false;await route.fulfill({json:{code,data:{orderId:'mock'}}});return;}
+  if(url.startsWith('https://www.binance.com/en/alpha/')){await route.fulfill({contentType:'text/html; charset=utf-8',body:`<!doctype html><html><body><button class="bn-tab__buySell active" onclick="document.querySelectorAll('.bn-tab__buySell').forEach(t=>t.classList.remove('active'));this.classList.add('active')">买入</button><button class="bn-tab__buySell" onclick="document.querySelectorAll('.bn-tab__buySell').forEach(t=>t.classList.remove('active'));this.classList.add('active')">卖出</button><button id="bn-tab-LIMIT" class="active">限价</button><input id="limitPrice"><input id="limitAmount"><button class="bn-button__buy" onclick="fetch('/bapi/asset/v1/private/alpha-trade/order/place',{method:'POST',body:JSON.stringify({price:window.formValues.limitPrice,amount:window.formValues.limitAmount})}).then(()=>fetch('/bapi/defi/v1/private/wallet-direct/cloud-wallet/alpha'))">买入 AAA</button><script>window.formValues={};for(const id of ['limitPrice','limitAmount']){const e=document.getElementById(id),d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');let tracked=e.value;window.formValues[id]=tracked;Object.defineProperty(e,'value',{get(){return d.get.call(this)},set(v){tracked=String(v);d.set.call(this,v)}});e.addEventListener('input',()=>{if(e.value!==tracked){tracked=e.value;window.formValues[id]=e.value}})}</script></body></html>`});return;}
   await route.abort();
  });
  for(let i=0;i<100&&context.serviceWorkers().length<2;i++)await new Promise(r=>setTimeout(r,100));
@@ -42,6 +42,13 @@ for(const label of ['A','B'])require('node:child_process').execFileSync(process.
  }
  assert.equal(actualOrders.length,2);
  assert.deepEqual(actualOrders.map(x=>JSON.parse(x.body).amount).sort(),['1','2']);
+ rejectNext=true;
+ await workers[0].evaluate(()=>enqueueOrder({chainName:'bsc',address:'0xaaa',price:'1',amt:'3',symbol:'AAA',unionId:'order-0'}));
+ const failure=await workers[0].evaluate(()=>protocolReplies.filter(m=>m.type==='orderResult').at(-1));assert.equal(failure.data.orderData.code,'INSUFFICIENT_BALANCE');assert.equal(failure.data.orderData.pageDiagnostics.beforeSubmit.values.limitAmount,'3');
+ await workers[0].evaluate(()=>enqueueOrder({chainName:'bsc',address:'0xaaa',price:'1',amt:'4',symbol:'AAA',unionId:'order-0'}));
+ const retried=await workers[0].evaluate(()=>protocolReplies.filter(m=>m.type==='orderResult').at(-1));assert.equal(retried.data.orderData.code,'000000');assert.equal(actualOrders.length,4);assert.equal(JSON.parse(actualOrders.at(-1).body).amount,'4');
+ for(let i=0;i<100 && (await workers[0].evaluate(()=>protocolReplies.filter(m=>m.type==='isready').length))<3;i++)await new Promise(r=>setTimeout(r,50));
+ assert.equal(await workers[0].evaluate(()=>protocolReplies.filter(m=>m.type==='isready').length),3);
  const beforeRefresh=await workers[0].evaluate(()=>protocolReplies.length);
  const refreshed=await workers[0].evaluate(()=>handleWebSocketMessage({type:'ready',data:{chainName:'bsc',address:'0xaaa'}}));assert.equal(refreshed.refreshed,true,JSON.stringify(refreshed));assert.equal(refreshed.healthy,true,JSON.stringify(refreshed));assert.equal(await workers[0].evaluate(()=>protocolReplies.length),beforeRefresh);
  const tab=await workers[0].evaluate(async()=>{const b=await windowBinding.require();return (await chrome.tabs.query({windowId:b.windowId,url:'https://www.binance.com/*'}))[0]});

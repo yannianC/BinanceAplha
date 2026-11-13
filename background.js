@@ -536,8 +536,6 @@ async function handlePageCommand(message, expected = null) {
     const page=await withTimeout(chrome.tabs.sendMessage(tab.id,{action:'checkReady'}),5000);
     if(AlphaTrade.assetKey(page?.url)!==AlphaTrade.assetKey(url))throw Error('币种已变化');
     Object.assign(result,page);
-    const queue=await tradeQueue.status();
-    if(queue.blocked){result.canTrade=false;result.error='QUEUE_BLOCKED';}
     result.windowId=binding.windowId;
   } catch(e){result.healthy=false;result.canTrade=false;result.error=e.message;}
   finally {if(locked){maintenance=false;void assetReadiness.flush();}}
@@ -585,7 +583,7 @@ async function enqueueOrder(data) {
       direction: Number(amt) > 0 ? 'Buy' : 'Sell', coin: symbol, unionId, bindingToken:binding.token
     };
     AlphaTrade.assetKey(trade.url);
-    await tradeQueue.submit(trade).catch(e => notify('交易队列暂停', e.message));
+    await tradeQueue.submit(trade).catch(e => notify('订单结果上报失败', e.message));
   } catch (e) { reportTradeResult(AlphaTrade.failure(unionId, 'INVALID_ORDER', e.message)); }
   finally {if(accepting)acceptingOrders--;void assetReadiness.flush();}
 }
@@ -626,8 +624,8 @@ async function executeTrade(tradeInfo) {
     if (AlphaTrade.assetKey(current.url) !== AlphaTrade.assetKey(tradeInfo.url)) throw Error('标签页已切换到其他币种');
     await windowBinding.authorize(tabId,tradeInfo.bindingToken);
     dispatched = true;
-    const result = await withTimeout(chrome.tabs.sendMessage(tabId, {action:'executeTrade',data:{...tradeInfo, deadline:Date.now()+80000}}), 90000);
-    if (!result || result.protocol !== 3 || !result.data) throw Error('页面返回了旧版或无效回执');
+    const result = await withTimeout(chrome.tabs.sendMessage(tabId, {action:'executeTrade',data:{...tradeInfo, attemptId:crypto.randomUUID(), deadline:Date.now()+80000}}), 90000);
+    if (!result || result.protocol !== 4 || !result.data) throw Error('页面返回了旧版或无效回执');
     assetReadiness.finish(ticket,result.data.bnResp===1 && String(result.data.orderData?.code)==='000000');
     return result.data;
   } catch (e) {
@@ -671,7 +669,7 @@ function sleep(ms) {
  */
 async function ensureContentScriptLoaded(tabId) {
   const reply = await chrome.tabs.sendMessage(tabId, {action:'activatePage'});
-  if (reply?.protocol !== 3 || !reply.authorized) throw Error('请刷新币安标签页以加载新版插件');
+  if (reply?.protocol !== 4 || !reply.authorized) throw Error('请刷新币安标签页以加载新版插件');
 }
 
 /**
@@ -716,7 +714,7 @@ async function waitForTabLoaded(tabId) {
  * 监听来自content script的消息
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (['getConnectionStatus','testTrade','resumeQueue','preloadTabs','bindWindow','openAlpha','connectWS','refreshAssetsTest'].includes(request.action) && sender.url !== chrome.runtime.getURL('popup.html')) { sendResponse({error:'仅插件弹窗可操作'}); return false; }
+  if (['getConnectionStatus','testTrade','preloadTabs','bindWindow','openAlpha','connectWS','refreshAssetsTest'].includes(request.action) && sender.url !== chrome.runtime.getURL('popup.html')) { sendResponse({error:'仅插件弹窗可操作'}); return false; }
   if (request.action === 'authorizePage') {
     authorizeSender(sender,request.token).then(b=>sendResponse({authorized:true,token:b.token,instanceId:chrome.runtime.id})).catch(e=>sendResponse({authorized:false,error:e.message}));
     return true;
@@ -794,8 +792,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({success:true});
   } else if (request.action === 'queueStatus') {
     tradeQueue.status().then(sendResponse).catch(e=>sendResponse({error:e.message}));
-  } else if (request.action === 'resumeQueue') {
-    tradeQueue.resume().then(()=>sendResponse({success:true})).catch(e=>sendResponse({error:e.message}));
+
   } else if (request.action === 'preloadTabs') {
     (async()=>{
       const urls = request.urls;

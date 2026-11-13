@@ -173,21 +173,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 document.addEventListener('DOMContentLoaded', async () => {
   const urls = document.getElementById('favoriteUrls');
   const info = document.getElementById('queueInfo');
-  const resume = document.getElementById('resumeQueueBtn');
   urls.value = ((await chrome.storage.local.get('alphaFavoriteUrls')).alphaFavoriteUrls || []).join('\n');
   async function refresh() {
     const state = await chrome.runtime.sendMessage({action:'queueStatus'});
-    info.textContent = state.error || (state.blocked ? '队列已暂停：请先核对币安订单，结果不明的订单不会自动重下。' : '多币种顺序下单已启用；已打开的币种页会自动复用。');
-    resume.hidden = !state.blocked;
+    info.textContent = state.error || '同一实例顺序操作；失败后继续接单，去重和重试由服务器控制。';
   }
   document.getElementById('preloadBtn').addEventListener('click', async () => {
     const result = await chrome.runtime.sendMessage({action:'preloadTabs',urls:urls.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)});
     info.textContent = result.error || '已保存并打开币种页；首次加载请依次查看页面是否登录、可交易。';
-  });
-  resume.addEventListener('click', async () => {
-    if (!confirm('已在币安核对结果不明的订单，且关闭遗留确认弹窗？恢复后仅接收新指令，不重放旧单。')) return;
-    const result = await chrome.runtime.sendMessage({action:'resumeQueue'});
-    if (result.error) info.textContent=result.error; else await refresh();
   });
   await refresh();
 });

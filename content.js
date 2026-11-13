@@ -34,7 +34,7 @@ async function activatePage() {
   });
   await injectionPromise;
   bridgePost({type:'ALPHA_ENABLE'});
-  return {protocol:3,authorized:true};
+  return {protocol:4,authorized:true};
 }
 // Unbound copies remain inert and do not install page-world interceptors.
 activatePage().catch(()=>{});
@@ -100,7 +100,7 @@ window.addEventListener('message', (event) => {
     activeTrade.armed = true;
   }
   if (event.data.type === 'FETCH_RESPONSE' && activeTrade && event.data.unionId === activeTrade.id) {
-    activeTrade.receipt = {unionId:activeTrade.id, orderData:event.data.data, bnResp:1};
+    activeTrade.receipt = {unionId:activeTrade.unionId, orderData:event.data.data, bnResp:1};
   }
 });
 
@@ -109,18 +109,18 @@ window.addEventListener('message', (event) => {
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'activatePage') {
-    activatePage().then(sendResponse).catch(e=>sendResponse({protocol:3,authorized:false,error:e.message}));return true;
+    activatePage().then(sendResponse).catch(e=>sendResponse({protocol:4,authorized:false,error:e.message}));return true;
   }
   if (request.action === 'checkReady') {
     checkPageReady().then(sendResponse).catch(e=>sendResponse({healthy:false,canTrade:false,error:e.message}));return true;
   }
   if (request.action === 'ping') {
     // 响应ping消息，表示content script已就绪
-    sendResponse({ success: true, ready: true, protocol:3 });
+    sendResponse({ success: true, ready: true, protocol:4 });
     return true;
   } else if (request.action === 'executeTrade') {
     executeTradeOnPage(request.data)
-      .then(data => sendResponse({ protocol:3, data }))
+      .then(data => sendResponse({ protocol:4, data }))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true; // 保持消息通道打开
   }
@@ -133,7 +133,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 async function executeTradeOnPage(tradeInfo) {
   const {url, price, amount, direction, coin, unionId, deadline:executionDeadline} = tradeInfo;
   if (activeTrade) return AlphaTrade.failure(unionId, 'ORDER_STATUS_UNKNOWN', '页面已有未完成的订单，请核对订单');
-  const trade = {id:unionId, armed:false, receipt:null, clicked:false,token:tradeInfo.bindingToken,deadline:executionDeadline,url};
+  const trade = {id:tradeInfo.attemptId || unionId, unionId, armed:false, receipt:null, clicked:false,token:tradeInfo.bindingToken,deadline:executionDeadline,url};
   activeTrade = trade;
   try {
     if(!pageBinding || pageBinding!==trade.token)throw Error('窗口绑定已变化');
@@ -152,25 +152,26 @@ async function executeTradeOnPage(tradeInfo) {
     await setInputValue('limitPrice', price);
     await checkPageAuthority(trade.token);
     await setInputValue('limitAmount', amount);
-    await sleep(300);
+    await waitForOrderForm(direction,price,amount);
+    trade.formBeforeSubmit = captureOrderForm();
     checkAsset();
     // Arm the interceptor and wait for acknowledgment before allowing a click.
-    bridgePost({type:'ALPHA_ARM_ORDER', unionId});
+    bridgePost({type:'ALPHA_ARM_ORDER', unionId:trade.id});
     const armDeadline = Date.now()+2000;
     while (!trade.armed && Date.now()<armDeadline) await sleep(25);
     if (!trade.armed) throw Error('订单回执拦截器未就绪，请刷新页面');
-    await clickSubmitButton(direction, coin, () => {checkAsset();trade.clicked=true;});
+    await clickSubmitButton(direction, coin, () => {checkAsset();assertOrderForm(direction,price,amount);trade.clicked=true;});
     await sleep(100);
     // A direct API response ends the dialog wait immediately.
     await clickDialogConfirmButton(trade, checkAsset);
     const deadline = Date.now()+30000;
     while (!trade.receipt && Date.now()<deadline) await sleep(100);
     if (!trade.receipt) throw Error('未收到币安下单回执，请核对订单');
-    return trade.receipt;
+    return attachOrderDiagnostics(trade.receipt,trade);
   } catch (e) {
-    return trade.receipt || AlphaTrade.failure(unionId,trade.clicked ? 'ORDER_STATUS_UNKNOWN' : 'EXECUTION_ERROR',e.message);
+    return attachOrderDiagnostics(trade.receipt || AlphaTrade.failure(unionId,trade.clicked ? 'ORDER_STATUS_UNKNOWN' : 'EXECUTION_ERROR',e.message),trade);
   } finally {
-    bridgePost({type:'ALPHA_DISARM_ORDER',unionId});
+    bridgePost({type:'ALPHA_DISARM_ORDER',unionId:trade.id});
     activeTrade = null;
   }
 }
@@ -195,11 +196,7 @@ async function waitForPageReady() {
 async function clickTradeTab(direction) {
   const wantText = direction === 'Buy' ? '买入' : '卖出';
 
-  const findTab = () => {
-    const tabs = Array.from(document.querySelectorAll('.bn-tab__buySell'));
-    return tabs.find(t => (t.textContent || '').trim() === wantText)
-        || tabs[direction === 'Buy' ? 0 : 1];
-  };
+  const findTab = () => findTradeDirectionTab(direction);
 
   let tab = findTab();
   const deadline = Date.now() + 10000;
@@ -213,6 +210,11 @@ async function clickTradeTab(direction) {
 
   console.log(`点击${wantText}标签:`, (tab.textContent || '').trim());
   await authorizedClick(tab);
+  const selectedDeadline=Date.now()+3000;
+  while (!findTab()?.classList.contains('active')) {
+    if(Date.now()>=selectedDeadline)throw Error('买卖方向切换未完成');
+    await sleep(100);
+  }
 }
 
 /**
@@ -233,27 +235,64 @@ async function ensureLimitOrderTab() {
  * @param {string} value - 要设置的值
  */
 async function setInputValue(inputId, value) {
-  const input = await waitForElement(`#${inputId}`, 10000);
-  
-  console.log(`设置${inputId}的值为:`, value);
-  
-  // 清空原有值
-  input.value = '';
-  
-  // 触发focus事件
-  input.focus();
-  
-  // 设置新值
-  input.value = value;
-  
-  // 触发input和change事件以确保React等框架能检测到变化
-  const inputEvent = new Event('input', { bubbles: true, cancelable: true });
-  const changeEvent = new Event('change', { bubbles: true, cancelable: true });
-  input.dispatchEvent(inputEvent);
-  input.dispatchEvent(changeEvent);
-  
-  // 触发blur事件
-  input.blur();
+  const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+  // Bypass React's own value tracker so the input event reaches its form state.
+  for (const next of ['', String(value)]) {
+    const input = await waitForElement(`#${inputId}`, 10000);
+    if(input.disabled || input.readOnly)throw Error('交易输入框不可编辑');
+    input.focus();
+    nativeSetter.call(input,next);
+    input.dispatchEvent(new Event('input',{bubbles:true}));
+    input.dispatchEvent(new Event('change',{bubbles:true}));
+    input.blur();
+    await sleep(150);
+  }
+}
+
+function normalizedFormNumber(value) {
+  const text=String(value ?? '').replace(/,/g,'').trim();
+  if(!/^\d+(?:\.\d+)?$/.test(text))return null;
+  const [whole,fraction='']=text.split('.');
+  return (whole.replace(/^0+(?=\d)/,'') || '0')+'.'+fraction.replace(/0+$/,'');
+}
+function findTradeDirectionTab(direction, tabs) {
+  tabs = tabs || Array.from(document.querySelectorAll('.bn-tab__buySell')).filter(e=>e.offsetParent!==null);
+  const label = direction==='Buy' ? /^(买入|Buy)$/i : /^(卖出|Sell)$/i;
+  return tabs.find(e=>label.test((e.textContent || '').trim())) || tabs[direction==='Buy'?0:1];
+}
+function assertOrderForm(direction,price,amount) {
+  const tabs=Array.from(document.querySelectorAll('.bn-tab__buySell')).filter(e=>e.offsetParent!==null);
+  const target=findTradeDirectionTab(direction,tabs);
+  if(!target || !target.classList.contains('active'))throw Error('买卖方向与指令不符');
+  if(!document.getElementById('bn-tab-LIMIT')?.classList.contains('active'))throw Error('限价表单尚未就绪');
+  for(const [id,value] of [['limitPrice',price],['limitAmount',amount]]) {
+    const input=document.getElementById(id);
+    if(!input || input.disabled || input.readOnly || normalizedFormNumber(input.value)===null || normalizedFormNumber(input.value)!==normalizedFormNumber(value))throw Error('表单数值未同步：'+id);
+  }
+}
+async function waitForOrderForm(direction,price,amount) {
+  const deadline=Date.now()+3000;let stable=0,lastError;
+  while(Date.now()<deadline) {
+    try {assertOrderForm(direction,price,amount);stable++;if(stable>=3)return;}
+    catch(e){stable=0;lastError=e;}
+    await sleep(150);
+  }
+  throw lastError || Error('交易表单未稳定');
+}
+function captureOrderForm() {
+  const values={};
+  for(const id of ['limitPrice','limitAmount','limitTotal'])values[id]=document.getElementById(id)?.value || '';
+  const lines=(document.body?.innerText || '').split(/\n/);
+  const balanceHints=[];
+  for(let i=0;i<lines.length && balanceHints.length<8;i++) {
+    if(/余额|可用|不足|Available|Insufficient|冻结/i.test(lines[i]))balanceHints.push(lines.slice(Math.max(0,i-1),i+3).join(' ').slice(0,200));
+  }
+  return {at:Date.now(),values,balanceHints};
+}
+function attachOrderDiagnostics(result,trade) {
+  if(String(result?.orderData?.code)==='000000')return result;
+  try {result.orderData={...result.orderData,pageDiagnostics:{beforeSubmit:trade.formBeforeSubmit || null,after:captureOrderForm()}};}catch(_){}
+  return result;
 }
 
 /**
