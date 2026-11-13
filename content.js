@@ -147,7 +147,6 @@ async function executeTradeOnPage(tradeInfo) {
     await clickKnowItButton();
     await clickTradeTab(direction);
     await ensureLimitOrderTab();
-    await sleep(500);
     await checkPageAuthority(trade.token);
     await setInputValue('limitPrice', price);
     await checkPageAuthority(trade.token);
@@ -209,7 +208,7 @@ async function clickTradeTab(direction) {
   }
 
   console.log(`点击${wantText}标签:`, (tab.textContent || '').trim());
-  await authorizedClick(tab);
+  if(!tab.classList.contains('active'))await authorizedClick(tab);
   const selectedDeadline=Date.now()+3000;
   while (!findTab()?.classList.contains('active')) {
     if(Date.now()>=selectedDeadline)throw Error('买卖方向切换未完成');
@@ -225,7 +224,14 @@ async function ensureLimitOrderTab() {
   if (limitTab && !limitTab.classList.contains('active')) {
     console.log('当前不是限价单，切换到限价');
     await authorizedClick(limitTab);
-    await sleep(300);
+  }
+  const deadline=Date.now()+3000;
+  while(true) {
+    const inputs=['limitPrice','limitAmount'].map(id=>document.getElementById(id));
+    if(document.getElementById('bn-tab-LIMIT')?.classList.contains('active') &&
+        inputs.every(e=>e && e.offsetParent!==null && !e.disabled && !e.readOnly))return;
+    if(Date.now()>=deadline)throw Error('限价输入框尚未就绪');
+    await waitForFormUpdate();
   }
 }
 
@@ -245,8 +251,18 @@ async function setInputValue(inputId, value) {
     input.dispatchEvent(new Event('input',{bubbles:true}));
     input.dispatchEvent(new Event('change',{bubbles:true}));
     input.blur();
-    await sleep(150);
+    await waitForFormUpdate();
   }
+}
+
+// Let controlled inputs commit a render; hidden windows use a timer fallback (subject to browser throttling).
+function waitForFormUpdate() {
+  return new Promise(resolve=>{
+    let frame,timer,done=false;
+    const finish=()=>{if(done)return;done=true;clearTimeout(timer);cancelAnimationFrame(frame);resolve();};
+    timer=setTimeout(finish,50);
+    frame=requestAnimationFrame(finish);
+  });
 }
 
 function normalizedFormNumber(value) {
@@ -273,9 +289,14 @@ function assertOrderForm(direction,price,amount) {
 async function waitForOrderForm(direction,price,amount) {
   const deadline=Date.now()+3000;let stable=0,lastError;
   while(Date.now()<deadline) {
-    try {assertOrderForm(direction,price,amount);stable++;if(stable>=3)return;}
+    try {
+      assertOrderForm(direction,price,amount);
+      const selector=direction==='Buy'?'button[class*="bn-button__buy"]':'button[class*="bn-button__sell"]';
+      if(!Array.from(document.querySelectorAll(selector)).some(e=>e.offsetParent!==null && !e.disabled))throw Error('提交按钮尚未就绪');
+      stable++;if(stable>=3)return;
+    }
     catch(e){stable=0;lastError=e;}
-    await sleep(150);
+    await waitForFormUpdate();
   }
   throw lastError || Error('交易表单未稳定');
 }
@@ -317,8 +338,10 @@ async function clickSubmitButton(direction, coin, beforeClick) {
 
     if (buttonText.includes(coin)) {
       console.log(`找到匹配的按钮，准备点击: "${buttonText}"`);
-      await sleep(200);
-      await authorizedClick(button,beforeClick);
+      await authorizedClick(button,()=>{
+        if(button.isConnected===false || button.disabled)throw Error('提交按钮状态已变化');
+        beforeClick();
+      });
       console.log('按钮已点击');
       return;
     }

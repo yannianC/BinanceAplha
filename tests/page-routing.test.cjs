@@ -97,7 +97,7 @@ test('input setter updates tracked form state, not only displayed DOM value',asy
  Object.defineProperty(input,'value',{get(){return this.raw},set(v){this.raw=String(v);this.tracked=String(v)}});
  const text=fs.readFileSync('content.js','utf8');const start=text.indexOf('async function setInputValue('),end=text.indexOf('async function clickSubmitButton(',start);
  const ctx=vm.createContext({HTMLInputElement:Input,Event:class{constructor(type){this.type=type}},console:silent,waitForElement:async()=>input,sleep:async()=>{}});vm.runInContext(text.slice(start,end),ctx);
- await ctx.setInputValue('limitAmount','945');assert.equal(input.value,'945');assert.equal(input.model,'945');
+ ctx.waitForFormUpdate=async()=>{};await ctx.setInputValue('limitAmount','945');assert.equal(input.value,'945');assert.equal(input.model,'945');
 });
 
 test('same unionId retry ignores previous attempt response and keeps server ID in result',async()=>{
@@ -120,4 +120,29 @@ test('form direction guard supports visible English Buy/Sell tabs',()=>{
  let active='Sell';const tabs=['Buy','Sell'].map(text=>({textContent:text,offsetParent:{},classList:{contains:()=>active===text}}));
  ctx.document={querySelectorAll:()=>[{textContent:'卖出',offsetParent:null,classList:{contains:()=>true}},...tabs],getElementById:id=>id==='bn-tab-LIMIT'?{classList:{contains:()=>true}}:{value:id==='limitPrice'?'1':'945'}};
  ctx.assertOrderForm('Sell','1','945');assert.throws(()=>ctx.assertOrderForm('Buy','1','945'));active='Buy';ctx.assertOrderForm('Buy','1','945');assert.throws(()=>ctx.assertOrderForm('Sell','1','945'));
+});
+
+test('stable form proceeds after render passes without fixed 150ms polling delays',async()=>{
+ let now=0;const text=fs.readFileSync('content.js','utf8');
+ const ctx=vm.createContext({Date:{now:()=>now},sleep:async ms=>{now+=ms}});
+ vm.runInContext(text.slice(text.indexOf('function normalizedFormNumber'),text.indexOf('async function clickSubmitButton')),ctx);
+ ctx.document={querySelectorAll:()=>[{offsetParent:{},disabled:false}]};ctx.assertOrderForm=()=>{};ctx.waitForFormUpdate=async()=>{now+=16};
+ await ctx.waitForOrderForm('Buy','1','2');assert(now<=100,`stable form took ${now}ms`);
+});
+
+test('form waits for delayed button readiness instead of submitting early',async()=>{
+ let now=0;const text=fs.readFileSync('content.js','utf8');const ctx=vm.createContext({Date:{now:()=>now}});
+ vm.runInContext(text.slice(text.indexOf('function normalizedFormNumber'),text.indexOf('async function clickSubmitButton')),ctx);
+ ctx.assertOrderForm=()=>{};ctx.waitForFormUpdate=async()=>{now+=16};
+ ctx.document={querySelectorAll:()=>[{offsetParent:{},get disabled(){return now<160}}]};
+ await ctx.waitForOrderForm('Buy','1','2');assert(now>=192);assert(now<300);
+});
+test('render wait uses timer fallback in hidden pages and cancels unused callback',async()=>{
+ const text=fs.readFileSync('content.js','utf8');
+ for(const winner of ['frame','timer']){
+  let frame,timer,cleared=false,cancelled=false;
+  const ctx=vm.createContext({requestAnimationFrame:cb=>{frame=cb;return 1},cancelAnimationFrame:id=>{cancelled=id===1},setTimeout:cb=>{timer=cb;return 2},clearTimeout:id=>{cleared=id===2}});
+  vm.runInContext(text.slice(text.indexOf('function waitForFormUpdate'),text.indexOf('function normalizedFormNumber')),ctx);
+  const wait=ctx.waitForFormUpdate();(winner==='frame'?frame:timer)();await wait;assert(cleared);assert(cancelled);
+ }
 });

@@ -11,7 +11,7 @@ for(const label of ['A','B'])require('node:child_process').execFileSync(process.
   const url=route.request().url();
   if(url.startsWith('chrome-extension:')){await route.continue();return;}
   if(url.includes('/cloud-wallet/alpha')){await route.fulfill({json:{code:'000000',data:{list:[{chainId:'56',contractAddress:'0xaaa',free:String(100-actualOrders.length),freeze:'0'}]}}});return;}
-  if(url.includes('/alpha-trade/order/place')){actualOrders.push({url,body:route.request().postData()});const code=rejectNext?'INSUFFICIENT_BALANCE':'000000';rejectNext=false;await route.fulfill({json:{code,data:{orderId:'mock'}}});return;}
+  if(url.includes('/alpha-trade/order/place')){actualOrders.push({at:Date.now(),url,body:route.request().postData()});const code=rejectNext?'INSUFFICIENT_BALANCE':'000000';rejectNext=false;await route.fulfill({json:{code,data:{orderId:'mock'}}});return;}
   if(url.startsWith('https://www.binance.com/en/alpha/')){await route.fulfill({contentType:'text/html; charset=utf-8',body:`<!doctype html><html><body><button class="bn-tab__buySell active" onclick="document.querySelectorAll('.bn-tab__buySell').forEach(t=>t.classList.remove('active'));this.classList.add('active')">买入</button><button class="bn-tab__buySell" onclick="document.querySelectorAll('.bn-tab__buySell').forEach(t=>t.classList.remove('active'));this.classList.add('active')">卖出</button><button id="bn-tab-LIMIT" class="active">限价</button><input id="limitPrice"><input id="limitAmount"><button class="bn-button__buy" onclick="fetch('/bapi/asset/v1/private/alpha-trade/order/place',{method:'POST',body:JSON.stringify({price:window.formValues.limitPrice,amount:window.formValues.limitAmount})}).then(()=>fetch('/bapi/defi/v1/private/wallet-direct/cloud-wallet/alpha'))">买入 AAA</button><script>window.formValues={};for(const id of ['limitPrice','limitAmount']){const e=document.getElementById(id),d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');let tracked=e.value;window.formValues[id]=tracked;Object.defineProperty(e,'value',{get(){return d.get.call(this)},set(v){tracked=String(v);d.set.call(this,v)}});e.addEventListener('input',()=>{if(e.value!==tracked){tracked=e.value;window.formValues[id]=e.value}})}</script></body></html>`});return;}
   await route.abort();
  });
@@ -33,6 +33,7 @@ for(const label of ['A','B'])require('node:child_process').execFileSync(process.
  }
  for(const p of context.pages().filter(p=>p.url().includes('/alpha/bsc/')))await p.evaluate(()=>fetch('/bapi/defi/v1/private/wallet-direct/cloud-wallet/alpha'));
  for(const w of workers){for(let i=0;i<100 && !(await w.evaluate(()=>assetReadiness.key!==null));i++)await new Promise(r=>setTimeout(r,50));assert(await w.evaluate(()=>assetReadiness.key!==null));}
+ const initialDispatchAt=Date.now();
  await Promise.all(workers.map((w,i)=>w.evaluate(async i=>enqueueOrder({chainName:'bsc',address:'0xaaa',price:'1',amt:String(i+1),symbol:'AAA',unionId:'order-'+i}),i)));
  for(const w of workers){
   for(let i=0;i<100 && (await w.evaluate(()=>protocolReplies.filter(m=>m.type==='isready').length))<2;i++)await new Promise(r=>setTimeout(r,50));
@@ -41,6 +42,7 @@ for(const label of ['A','B'])require('node:child_process').execFileSync(process.
   assert.equal(replies.filter(m=>m.type==='isready').length,2,JSON.stringify(replies));
  }
  assert.equal(actualOrders.length,2);
+ console.log('DISPATCH_TO_REQUEST_MS',actualOrders.map(o=>o.at-initialDispatchAt));
  assert.deepEqual(actualOrders.map(x=>JSON.parse(x.body).amount).sort(),['1','2']);
  rejectNext=true;
  await workers[0].evaluate(()=>enqueueOrder({chainName:'bsc',address:'0xaaa',price:'1',amt:'3',symbol:'AAA',unionId:'order-0'}));
