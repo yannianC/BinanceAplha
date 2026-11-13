@@ -32,6 +32,12 @@ for(const label of ['A','B'])require('node:child_process').execFileSync(process.
   const readyStarted=Date.now();const result=await workers[i].evaluate(()=>handleWebSocketMessage({type:'ready',data:{chainName:'bsc',address:'0xaaa'}}));const readyElapsed=Date.now()-readyStarted;assert(readyElapsed>=1800,`initial readiness replied before assets settled: ${readyElapsed}ms`);if(!result.healthy)console.log('DOMS',await Promise.all(context.pages().filter(p=>p.url().includes('/alpha/bsc/')).map(p=>p.evaluate(()=>({html:document.body.innerHTML,ready:document.readyState,visible:[...document.querySelectorAll('input,button')].map(e=>({id:e.id,visible:!!e.offsetParent}))})))));assert.equal(result.healthy,true,JSON.stringify(result));assert.equal(result.windowId,windows[i].id);assert.deepEqual(await workers[i].evaluate(()=>protocolReplies),[{type:'isready'}]);
  }
  for(const p of context.pages().filter(p=>p.url().includes('/alpha/bsc/')))await p.evaluate(()=>fetch('/bapi/defi/v1/private/wallet-direct/cloud-wallet/alpha'));
+ // Simulate a stale page receiver after extension update; recover through a real page reload.
+ for(const w of workers)await w.evaluate(()=>{
+  const send=chrome.tabs.sendMessage,reload=chrome.tabs.reload;let missing=true;globalThis.recoveryReloads=0;
+  chrome.tabs.sendMessage=async(...args)=>{if(missing && args[1].action==='activatePage'){missing=false;throw Error('Could not establish connection. Receiving end does not exist.')}return send(...args)};
+  chrome.tabs.reload=async(...args)=>{recoveryReloads++;return reload(...args)};
+ });
  const initialDispatchAt=Date.now();
  await Promise.all(workers.map((w,i)=>w.evaluate(async i=>enqueueOrder({chainName:'bsc',address:'0xaaa',price:'1',amt:String(i+1),symbol:'AAA',unionId:'order-'+i}),i)));
  for(const w of workers){
@@ -41,6 +47,7 @@ for(const label of ['A','B'])require('node:child_process').execFileSync(process.
   assert.equal(replies.filter(m=>m.type==='isready').length,2,JSON.stringify(replies));
  }
  assert.equal(actualOrders.length,2);
+ for(const w of workers)assert.equal(await w.evaluate(()=>recoveryReloads),1);
  for(const w of workers)assert.equal(await w.evaluate(async()=>{const b=await windowBinding.require();const t=(await chrome.tabs.query({windowId:b.windowId,url:'https://www.binance.com/*'}))[0];return (await chrome.tabs.sendMessage(t.id,{action:'checkReady'})).canTrade}),true);
  for(const p of context.pages().filter(p=>p.url().includes('/alpha/bsc/0xaaa')))assert.equal(await p.evaluate(()=>window.amountSets),2);
  for(const w of workers)assert.deepEqual((await w.evaluate(()=>protocolReplies)).slice(1).map(m=>m.type),['isready','orderResult']);

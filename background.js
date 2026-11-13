@@ -650,7 +650,17 @@ async function executeTrade(tradeInfo) {
     tradingTabId = tabId; // Popup display only.
     await chrome.tabs.update(tabId, {active:true, autoDiscardable:false});
     await waitForTabLoaded(tabId);
-    await ensureContentScriptLoaded(tabId);
+    try {await withTimeout(ensureContentScriptLoaded(tabId),3000);}
+    catch(e) {
+      // Recovery is allowed only before executeTrade has been dispatched to the page.
+      if(e.code!=='CONTENT_PROTOCOL_MISMATCH' && !/Receiving end does not exist|Could not establish connection/i.test(e.message || ''))throw e;
+      if(ws!==dispatch.socket || ws?.readyState!==WebSocket.OPEN)throw Error('恢复页面前WebSocket连接已变化或断开');
+      await windowBinding.authorize(tabId,tradeInfo.bindingToken);
+      const target=await chrome.tabs.get(tabId);
+      if(AlphaTrade.assetKey(target.pendingUrl || target.url)!==AlphaTrade.assetKey(tradeInfo.url))throw Error('恢复页面前币种已变化');
+      await reloadBoundTab(tabId,tradeInfo.bindingToken);
+      await waitForReadyPage(tabId,tradeInfo.url,tradeInfo.bindingToken,dispatch.socket,false);
+    }
     const current = await chrome.tabs.get(tabId);
     if (AlphaTrade.assetKey(current.url) !== AlphaTrade.assetKey(tradeInfo.url)) throw Error('标签页已切换到其他币种');
     await windowBinding.authorize(tabId,tradeInfo.bindingToken);
@@ -711,7 +721,10 @@ function sleep(ms) {
  */
 async function ensureContentScriptLoaded(tabId) {
   const reply = await chrome.tabs.sendMessage(tabId, {action:'activatePage'});
-  if (reply?.protocol !== 7 || !reply.authorized) throw Error('请刷新币安标签页以加载新版插件');
+  if (reply?.protocol !== 7) {
+    const error=Error('请刷新币安标签页以加载新版插件');error.code='CONTENT_PROTOCOL_MISMATCH';throw error;
+  }
+  if(!reply.authorized)throw Error(reply.error || '当前页面未绑定本插件');
 }
 
 /**

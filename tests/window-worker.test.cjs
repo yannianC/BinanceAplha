@@ -193,3 +193,42 @@ test('closing window marker during readiness check prevents positive reply',asyn
  f.ctx.chrome.tabs.sendMessage=async(id,m)=>{const result=await original(id,m);if(m.action==='checkReady')await f.ctx.chrome.tabs.remove(f.session.windowBinding.markerId);return result};
  await f.ctx.handleWebSocketMessage({type:'ready',data:coin});assert.equal(f.out.length,0);
 });
+
+for(const mode of ['missing','old'])test(`order recovers ${mode} content before dispatch exactly once`,async()=>{
+ const f=await boundFixture();let reloads=0,orders=0,checks=0;const original=f.ctx.chrome.tabs.sendMessage;
+ f.ctx.chrome.tabs.reload=async id=>{reloads++;assert.equal(id,90);f.ctx.chrome.tabs.onUpdated.emit(id,{status:'complete'})};
+ f.ctx.chrome.tabs.sendMessage=async(id,m)=>{
+  if(m.action==='activatePage' && !reloads){if(mode==='missing')throw Error('Could not establish connection. Receiving end does not exist.');return {protocol:6,authorized:true};}
+  if(m.action==='checkReady'){checks++;return {healthy:true,canTrade:checks>=3,url:f.tabs.find(t=>t.id===id).url}}
+  if(m.action==='executeTrade'){orders++;assert.equal(checks,3);return {protocol:7,data:{unionId:m.data.unionId,bnResp:1,orderData:{code:'000000'}}}}
+  return original(id,m);
+ };
+ await f.ctx.enqueueOrder(trade('recovery'));assert.equal(reloads,1);assert.equal(orders,1);assert.equal(f.out.at(-1).data.orderData.code,'000000');assert.equal(f.out.some(m=>m.type==='isready'),false);
+});
+test('unrecoverable receiver refreshes once and never dispatches',async()=>{
+ const f=await boundFixture();let reloads=0;
+ f.ctx.chrome.tabs.reload=async id=>{reloads++;f.ctx.chrome.tabs.onUpdated.emit(id,{status:'complete'})};
+ f.ctx.chrome.tabs.sendMessage=async()=>{throw Error('Could not establish connection. Receiving end does not exist.')};
+ await f.ctx.enqueueOrder(trade('missing'));assert.equal(reloads,1);assert.equal(f.out.at(-1).data.orderData.code,'PAGE_NOT_READY');
+});
+test('lost connection after dispatch never refreshes or replays order',async()=>{
+ const f=await boundFixture();let orders=0,reloads=0;const original=f.ctx.chrome.tabs.sendMessage;
+ f.ctx.chrome.tabs.reload=async()=>{reloads++};
+ f.ctx.chrome.tabs.sendMessage=async(id,m)=>{if(m.action==='executeTrade'){orders++;throw Error('Could not establish connection. Receiving end does not exist.')}return original(id,m)};
+ await f.ctx.enqueueOrder(trade('dispatched'));assert.equal(orders,1);assert.equal(reloads,0);assert.equal(f.out.at(-1).data.orderData.code,'ORDER_STATUS_UNKNOWN');
+});
+
+for(const change of ['socket','coin','window'])test(`receiver recovery rejects changed ${change}`,async()=>{
+ const f=await boundFixture();let reloads=0;f.ctx.chrome.tabs.reload=async()=>{reloads++};
+ f.ctx.chrome.tabs.sendMessage=async()=>{
+  if(change==='socket')vm.runInContext('ws={readyState:1,send:m=>out.push(JSON.parse(m))}',f.ctx);
+  if(change==='coin')f.tabs.find(t=>t.id===90).url='https://www.binance.com/en/alpha/bsc/0xbbb';
+  if(change==='window')f.tabs.find(t=>t.id===90).windowId=99;
+  throw Error('Could not establish connection. Receiving end does not exist.');
+ };
+ await f.ctx.enqueueOrder(trade('changed'));assert.equal(reloads,0);assert.equal(f.out.at(-1).data.orderData.code,'PAGE_NOT_READY');
+});
+test('authorization denial does not trigger recovery refresh',async()=>{
+ const f=await boundFixture();let reloads=0;f.ctx.chrome.tabs.reload=async()=>{reloads++};f.ctx.chrome.tabs.sendMessage=async()=>({protocol:7,authorized:false,error:'Denied'});
+ await f.ctx.enqueueOrder(trade('denied'));assert.equal(reloads,0);assert.match(f.out.at(-1).data.orderData.message,/Denied/);
+});
