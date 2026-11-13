@@ -11,6 +11,10 @@ console.log('币安Alpha交易助手 - Content Script已加载');
 const instanceId = chrome.runtime.id;
 let pageBinding = null;
 let injectionPromise = null;
+const READY_SETTLE_MS=2000;
+let pageReadiness={token:null,assetKey:null,loaded:false,stableSince:null};
+function resetPageReadiness(assetKey=null,token=pageBinding){pageReadiness={token,assetKey,loaded:false,stableSince:null};}
+function validAssetSnapshot(data){if(String(data?.code)!=='000000')return false;const value=data?.data;return Array.isArray(value)||Array.isArray(value?.list)||Array.isArray(value?.assets);}
 function bridgePost(data) {window.postMessage({...data,instanceId,token:pageBinding}, '*');}
 async function checkPageAuthority(token = pageBinding) {
   const response = await chrome.runtime.sendMessage({action:'authorizePage',token});
@@ -34,7 +38,7 @@ async function activatePage() {
   });
   await injectionPromise;
   bridgePost({type:'ALPHA_ENABLE'});
-  return {protocol:4,authorized:true};
+  return {protocol:5,authorized:true};
 }
 // Unbound copies remain inert and do not install page-world interceptors.
 activatePage().catch(()=>{});
@@ -81,6 +85,16 @@ window.addEventListener('message', (event) => {
   }
 
   if (event.data.type === 'ALPHA_ASSETS_DATA') {
+    // Only a valid response started by this page may prove its current UI assets loaded.
+    try {
+      if(validAssetSnapshot(event.data.data)) {
+        const current=AlphaTrade.assetKey(location.href);
+        if(event.data.pageUrl && AlphaTrade.assetKey(event.data.pageUrl)===current) {
+          if(pageReadiness.token!==pageBinding || pageReadiness.assetKey!==current)resetPageReadiness(current);
+          pageReadiness.loaded=true;
+        }
+      }
+    } catch(_) {}
     // 页面自身拉到的资产数据（交易后币安前端自动刷新），转发 background 上报
     try {
       chrome.runtime.sendMessage({
@@ -109,18 +123,18 @@ window.addEventListener('message', (event) => {
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'activatePage') {
-    activatePage().then(sendResponse).catch(e=>sendResponse({protocol:4,authorized:false,error:e.message}));return true;
+    activatePage().then(sendResponse).catch(e=>sendResponse({protocol:5,authorized:false,error:e.message}));return true;
   }
   if (request.action === 'checkReady') {
     checkPageReady().then(sendResponse).catch(e=>sendResponse({healthy:false,canTrade:false,error:e.message}));return true;
   }
   if (request.action === 'ping') {
     // 响应ping消息，表示content script已就绪
-    sendResponse({ success: true, ready: true, protocol:4 });
+    sendResponse({ success: true, ready: true, protocol:5 });
     return true;
   } else if (request.action === 'executeTrade') {
     executeTradeOnPage(request.data)
-      .then(data => sendResponse({ protocol:4, data }))
+      .then(data => sendResponse({ protocol:5, data }))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true; // 保持消息通道打开
   }
@@ -147,11 +161,24 @@ async function executeTradeOnPage(tradeInfo) {
     await clickKnowItButton();
     await clickTradeTab(direction);
     await ensureLimitOrderTab();
-    await checkPageAuthority(trade.token);
-    await setInputValue('limitPrice', price);
-    await checkPageAuthority(trade.token);
-    await setInputValue('limitAmount', amount);
-    await waitForOrderForm(direction,price,amount);
+    const prepareForm=async()=>{
+      await checkPageAuthority(trade.token);
+      await setInputValue('limitPrice', price);
+      await checkPageAuthority(trade.token);
+      await setInputValue('limitAmount', amount);
+      await waitForOrderForm(direction,price,amount,coin);
+    };
+    try {await prepareForm();}
+    catch(e) {
+      if(e.code!=='FORM_NOT_READY' || trade.clicked)throw e;
+      // One bounded refill only before submission. Authority/coin/deadline stay enforced.
+      checkAsset();
+      await checkPageAuthority(trade.token);
+      await setInputValue('limitPrice', price);
+      await checkPageAuthority(trade.token);
+      await setInputValue('limitAmount', amount);
+      await waitForOrderForm(direction,price,amount,coin);
+    }
     trade.formBeforeSubmit = captureOrderForm();
     checkAsset();
     // Arm the interceptor and wait for acknowledgment before allowing a click.
@@ -271,6 +298,11 @@ function normalizedFormNumber(value) {
   const [whole,fraction='']=text.split('.');
   return (whole.replace(/^0+(?=\d)/,'') || '0')+'.'+fraction.replace(/0+$/,'');
 }
+function findSubmitButton(direction,coin) {
+  const buttonClass=direction==='Buy'?'bn-button__buy':'bn-button__sell';
+  return Array.from(document.querySelectorAll(`button[class*="${buttonClass}"]`))
+    .find(b=>b.offsetParent!==null && !b.disabled && (b.textContent || b.innerText || '').trim().includes(coin)) || null;
+}
 function findTradeDirectionTab(direction, tabs) {
   tabs = tabs || Array.from(document.querySelectorAll('.bn-tab__buySell')).filter(e=>e.offsetParent!==null);
   const label = direction==='Buy' ? /^(买入|Buy)$/i : /^(卖出|Sell)$/i;
@@ -286,13 +318,12 @@ function assertOrderForm(direction,price,amount) {
     if(!input || input.disabled || input.readOnly || normalizedFormNumber(input.value)===null || normalizedFormNumber(input.value)!==normalizedFormNumber(value))throw Error('表单数值未同步：'+id);
   }
 }
-async function waitForOrderForm(direction,price,amount) {
-  const deadline=Date.now()+3000;let stable=0,lastError;
+async function waitForOrderForm(direction,price,amount,coin) {
+  const deadline=Date.now()+1000;let stable=0,lastError;
   while(Date.now()<deadline) {
     try {
       assertOrderForm(direction,price,amount);
-      const selector=direction==='Buy'?'button[class*="bn-button__buy"]':'button[class*="bn-button__sell"]';
-      if(!Array.from(document.querySelectorAll(selector)).some(e=>e.offsetParent!==null && !e.disabled))throw Error('提交按钮尚未就绪');
+      if(!findSubmitButton(direction,coin)){const e=Error('提交按钮尚未就绪');e.code='FORM_NOT_READY';throw e;}
       stable++;if(stable>=3)return;
     }
     catch(e){stable=0;lastError=e;}
@@ -347,7 +378,9 @@ async function clickSubmitButton(direction, coin, beforeClick) {
     }
   }
 
-  throw new Error(`未找到包含币种"${coin}"的${dirText}按钮。候选按钮: ${texts.join(' | ') || '(无可用按钮)'}`);
+  const error=new Error(`未找到包含币种"${coin}"的${dirText}按钮。候选按钮: ${texts.join(' | ') || '(无可用按钮)'}`);
+  error.code='FORM_NOT_READY';
+  throw error;
 }
 
 /**
@@ -462,12 +495,24 @@ function sleep(ms) {
 async function checkPageReady() {
   await checkPageAuthority();
   const visible=e=>!!(e && e.offsetParent!==null);
+  const currentKey=AlphaTrade.assetKey(location.href);
+  if(pageReadiness.token!==pageBinding || pageReadiness.assetKey!==currentKey)resetPageReadiness(currentKey);
   const inputs=['limitPrice','limitAmount'].map(id=>document.getElementById(id));
   const controls=inputs.every(visible);
   const editable=inputs.every(e=>e && !e.disabled && !e.readOnly);
   const buttons=Array.from(document.querySelectorAll('button[class*="bn-button__buy"],button[class*="bn-button__sell"]')).filter(visible);
   const loginRequired=buttons.some(b=>/登录|Log In|Sign In/i.test(b.textContent || ''));
-  const healthy=document.readyState==='complete' && controls && buttons.length>0 && !loginRequired;
-  // An empty order form normally disables submit; readiness means it can accept an order.
-  return {healthy,canTrade:healthy && editable && !activeTrade,loginRequired,url:location.href,checkedAt:Date.now()};
+  const formHealthy=document.readyState==='complete' && controls && buttons.length>0 && !loginRequired;
+  if(!formHealthy || !editable || !pageReadiness.loaded)pageReadiness.stableSince=null;
+  else if(pageReadiness.stableSince===null)pageReadiness.stableSince=Date.now();
+  const assetsSettled=formHealthy && pageReadiness.loaded && pageReadiness.stableSince!==null && Date.now()-pageReadiness.stableSince>=READY_SETTLE_MS;
+  const healthy=formHealthy && pageReadiness.loaded && assetsSettled;
+  let error='';
+  if(!formHealthy)error='交易表单尚未加载';
+  else if(!pageReadiness.loaded)error='等待页面资产数据加载';
+  else if(!assetsSettled)error='等待页面资产和表单稳定';
+  else if(!editable)error='交易表单不可编辑';
+  else if(activeTrade)error='页面正在执行交易';
+  return {healthy,canTrade:healthy && editable && !activeTrade,loginRequired,url:location.href,checkedAt:Date.now(),
+    assetsLoaded:pageReadiness.loaded,assetsSettled,stableFor:pageReadiness.stableSince===null?0:Math.max(0,Date.now()-pageReadiness.stableSince),error};
 }
