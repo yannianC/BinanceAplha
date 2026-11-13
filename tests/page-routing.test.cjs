@@ -15,7 +15,7 @@ function routing(tabs) {
  }};
  const windowBinding={require:async()=>({windowId:1,token:"t"}),authorize:async id=>{if((await chrome.tabs.get(id)).windowId!==1)throw Error("wrong window")}};
  const ctx=vm.createContext({chrome,windowBinding,AlphaTrade,console:silent,setTimeout,clearTimeout,Date,URL,crypto:require('node:crypto').webcrypto});
- vm.runInContext('let tradingTabId,activeDispatch=null;const ws=null;'+source.slice(source.indexOf('async function executeTrade(tradeInfo)'),source.indexOf('/**\n * 监听来自content script')),ctx);
+ vm.runInContext('function logEvent(){}let tradingTabId,activeDispatch=null;const ws=null;'+source.slice(source.indexOf('async function executeTrade(tradeInfo)'),source.indexOf('/**\n * 监听来自content script')),ctx);
  return {ctx,sent,created};
 }
 test('A B A reuses pages across locales, creates missing B without closing A',async()=>{

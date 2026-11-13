@@ -213,3 +213,21 @@ document.addEventListener('DOMContentLoaded',()=>{
   }
   void showReadiness();setInterval(showReadiness,2000);
 });
+
+// Export a snapshot without exposing captured credentials or unrelated extension storage.
+document.addEventListener('DOMContentLoaded',()=>{
+  const button=document.getElementById('exportLogsBtn'),info=document.getElementById('localLogInfo');
+  button.addEventListener('click',async()=>{
+    button.disabled=true;
+    try {
+      const result=await chrome.runtime.sendMessage({action:'exportLocalLogs'});
+      if(result.error)throw Error(result.error);
+      const blob=new Blob([JSON.stringify(result,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob);
+      const link=document.createElement('a');link.href=url;
+      const label=chrome.runtime.getManifest().name.replace(/[^a-zA-Z0-9_-]/g,'');
+      link.download=`Alpha-${label || result.instanceId}-${new Date().toISOString().replace(/[:.]/g,'-')}.json`;
+      document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),10000);
+      info.textContent=`已导出 ${result.entries.length} 条日志`+(result.persisted?'':'；注意：最近写入失败，导出包含内存记录')+(result.dropped?`；繁忙时丢弃 ${result.dropped} 条`:'');
+    }catch(e){info.textContent='日志导出失败：'+e.message;}finally{button.disabled=false;}
+  });
+});

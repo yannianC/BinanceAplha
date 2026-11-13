@@ -78,6 +78,14 @@ for(const label of ['A','B'])require('node:child_process').execFileSync(process.
  }
  await popups[0].waitForFunction(()=>document.getElementById('readinessInfo').textContent.includes('已回复 isready'));
  console.log('PASS ready switches both bound windows to missing coin and popup confirms reply');
+ const downloaded=popups[0].waitForEvent('download');await popups[0].click('#exportLogsBtn');
+ const logDownload=await downloaded,logData=JSON.parse(fs.readFileSync(await logDownload.path(),'utf8'));
+ assert(logData.persisted);assert.equal(logData.instanceId,new URL(workers[0].url()).host);
+ for(const stage of ['form_retry','form_ready','submit_clicked','confirmation_clicked'])assert(logData.entries.some(e=>e.event==='page_step' && e.data.stage===stage),stage);
+ assert(logData.entries.some(e=>e.event==='isready_sent' && e.data.unionId==='order-0'));
+ assert(logData.entries.every(e=>e.timestamp && e.beijingTime && Number.isFinite(e.at)));
+ console.log('PASS local JSON log download with timestamps, retry/click events and instance ID');
+
  const tab=await workers[0].evaluate(async()=>{const b=await windowBinding.require();return (await chrome.tabs.query({windowId:b.windowId,url:'https://www.binance.com/*'}))[0]});
  await workers[0].evaluate(({tabId,windowId})=>chrome.tabs.move(tabId,{windowId,index:-1}),{tabId:tab.id,windowId:windows[1].id});
  const denied=await workers[0].evaluate(async tabId=>{try{await windowBinding.authorize(tabId);return false}catch{return true}},tab.id);assert.equal(denied,true);

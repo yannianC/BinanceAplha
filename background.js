@@ -3,7 +3,7 @@
  * 处理WebSocket连接和消息分发
  */
 
-importScripts('ws-config.js', 'trade-core.js', 'window-binding.js');
+importScripts('ws-config.js', 'trade-core.js', 'window-binding.js', 'local-log.js');
 
 let ws = null;
 let tradingTabId = null;
@@ -22,6 +22,14 @@ const windowBinding = new AlphaWindow.WindowBinding({
   remove:id=>chrome.tabs.remove(id),
   token:()=>crypto.randomUUID()
 });
+const localLog=new AlphaLocalLog.LocalLog({
+  load:async()=>(await chrome.storage.local.get('alphaLocalLogs')).alphaLocalLogs || [],
+  save:rows=>chrome.storage.local.set({alphaLocalLogs:rows})
+});
+function logEvent(event,data={}) {
+  const instanceNumber=/BINANCEALPHA-([0-9]+(?:-[0-9]+)?)$/.exec(wsUrl)?.[1] || '';
+  try {void localLog.append(event,{...data,instanceNumber,version:chrome.runtime.getManifest?.().version || ''});}catch(_){}
+}
 let activeDispatch=null;
 let maintenance = false;
 let acceptingOrders = 0;
@@ -326,6 +334,7 @@ function connectWebSocket() {
 
     sock.onopen = () => {
       if (sock !== ws) return;
+      logEvent('ws_open');
       publishConnectionStatus();
       console.log('WebSocket连接已建立');
       // 启动心跳机制
@@ -364,12 +373,14 @@ function connectWebSocket() {
 
     sock.onerror = (error) => {
       if (sock !== ws) return;
+      logEvent('ws_error');
       publishConnectionStatus();
       console.error('WebSocket错误:', error);
     };
 
     sock.onclose = (event) => {
       if (sock !== ws) return; // 陈旧连接关闭：不杀新连接心跳，也不安排重连
+      logEvent('ws_close',{code:event.code});
       publishConnectionStatus();
       console.log('===== WebSocket连接已关闭 =====');
       console.log('关闭代码:', event.code);
@@ -470,6 +481,7 @@ function getCloseCodeDescription(code) {
  * @param {Object} message - WebSocket消息对象
  */
 function handleWebSocketMessage(message) {
+  if(['order','ready','refresh','checkTradeReady','refreshTradePage'].includes(message.type))logEvent('server_command',{...message.data,type:message.type});
   // 消息格式示例:
   // {
   //   "type": "order",
@@ -540,6 +552,7 @@ async function handlePageCommand(message, expected = null) {
       isreadySent=true;
     }
   }
+  logEvent('page_check_result',{...diagnostic,healthy:result.healthy,canTrade:result.canTrade,isreadySent,reason:result.error});
   if(!expected)recordPageCommand(sequence,{...diagnostic,at:Date.now(),checking:false,isreadySent,
     healthy:result.healthy,canTrade:result.canTrade,windowId:result.windowId,url:result.url,
     reason:result.error || (!result.healthy || !result.canTrade ? '交易页面未就绪' : !isreadySent && compact ? 'WebSocket连接已变化或断开' : '')});
@@ -595,6 +608,7 @@ async function reloadBoundTab(tabId, token) {
 }
 
 async function enqueueOrder(data) {
+  logEvent('order_received',data);
   const {chainName, address, amt, symbol, price, unionId} = data;
   let accepting=false;
   try {
@@ -620,6 +634,7 @@ async function enqueueOrder(data) {
 }
 
 function reportTradeResult(data) {
+  logEvent('order_result',data);
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'orderResult',data}));
   const od = data.orderData || {};
   notify(data.bnResp === 1 ? '下单回执' : '下单未完成', `${data.unionId}: ${od.code || ''} ${od.message || ''}`);
@@ -639,7 +654,8 @@ tradeQueue.ready.catch(e => notify('交易队列无法初始化', e.message));
  * @param {Object} tradeInfo - 交易信息
  */
 async function executeTrade(tradeInfo) {
-  const dispatch={socket:ws,token:tradeInfo.bindingToken,url:tradeInfo.url,attemptId:crypto.randomUUID(),sent:false,tabId:null};
+  const dispatch={unionId:tradeInfo.unionId,socket:ws,token:tradeInfo.bindingToken,url:tradeInfo.url,attemptId:crypto.randomUUID(),sent:false,tabId:null};
+  logEvent('order_start',{unionId:tradeInfo.unionId,attemptId:dispatch.attemptId,price:tradeInfo.price,amount:tradeInfo.amount,direction:tradeInfo.direction,coin:tradeInfo.coin});
   let dispatched = false;
   try {
     const binding = await windowBinding.require();
@@ -658,13 +674,16 @@ async function executeTrade(tradeInfo) {
       await windowBinding.authorize(tabId,tradeInfo.bindingToken);
       const target=await chrome.tabs.get(tabId);
       if(AlphaTrade.assetKey(target.pendingUrl || target.url)!==AlphaTrade.assetKey(tradeInfo.url))throw Error('恢复页面前币种已变化');
+      logEvent('page_recovery_start',{unionId:tradeInfo.unionId,attemptId:dispatch.attemptId,tabId,reason:e.message});
       await reloadBoundTab(tabId,tradeInfo.bindingToken);
       await waitForReadyPage(tabId,tradeInfo.url,tradeInfo.bindingToken,dispatch.socket,false);
+      logEvent('page_recovery_complete',{unionId:tradeInfo.unionId,attemptId:dispatch.attemptId,tabId});
     }
     const current = await chrome.tabs.get(tabId);
     if (AlphaTrade.assetKey(current.url) !== AlphaTrade.assetKey(tradeInfo.url)) throw Error('标签页已切换到其他币种');
     await windowBinding.authorize(tabId,tradeInfo.bindingToken);
     dispatch.tabId=tabId;activeDispatch=dispatch;
+    logEvent('order_dispatch',{unionId:tradeInfo.unionId,attemptId:dispatch.attemptId,tabId});
     dispatched = true;
     const result = await withTimeout(chrome.tabs.sendMessage(tabId, {action:'executeTrade',data:{...tradeInfo, attemptId:dispatch.attemptId, deadline:Date.now()+80000}}), 90000);
     if (!result || result.protocol !== 7 || !result.data) throw Error('页面返回了旧版或无效回执');
@@ -683,6 +702,7 @@ async function announceConfirmedOrder(request,sender) {
   if(activeDispatch!==dispatch || dispatch.sent || ws!==dispatch.socket || ws?.readyState!==WebSocket.OPEN)return {sent:false};
   // This acknowledges a confirmation click, not exchange acceptance. The queue still serializes orders.
   dispatch.socket.send(JSON.stringify({type:'isready'}));dispatch.sent=true;
+  logEvent('isready_sent',{unionId:dispatch.unionId,attemptId:dispatch.attemptId,tabId:dispatch.tabId,stage:'confirmation_clicked'});
   return {sent:true};
 }
 
@@ -770,6 +790,21 @@ async function waitForTabLoaded(tabId) {
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (['getConnectionStatus','testTrade','preloadTabs','bindWindow','openAlpha','connectWS','refreshAssetsTest'].includes(request.action) && sender.url !== chrome.runtime.getURL('popup.html')) { sendResponse({error:'仅插件弹窗可操作'}); return false; }
+  if(request.action==='exportLocalLogs') {
+    if(sender.url!==chrome.runtime.getURL('popup.html')){sendResponse({error:'仅插件弹窗可导出日志'});return false;}
+    localLog.export().then(data=>sendResponse({...data,instanceId:chrome.runtime.id,version:chrome.runtime.getManifest?.().version || '',exportedAt:new Date().toISOString()})).catch(e=>sendResponse({error:e.message}));return true;
+  }
+  if(request.action==='pageLog') {
+    (async()=>{
+      const dispatch=activeDispatch;
+      if(!dispatch || request.attemptId!==dispatch.attemptId || request.token!==dispatch.token || sender.tab?.id!==dispatch.tabId)throw Error('日志订单已失效');
+      await authorizeSender(sender,request.token);
+      if(activeDispatch!==dispatch)throw Error('日志订单已结束');
+      if(!['form_retry','form_ready','submit_clicked','confirmation_clicked'].includes(request.stage))throw Error('无效日志步骤');
+      logEvent('page_step',{...request.details,stage:request.stage,unionId:dispatch.unionId,attemptId:dispatch.attemptId,tabId:dispatch.tabId,at:request.at});
+      return {success:true};
+    })().then(sendResponse).catch(e=>sendResponse({error:e.message}));return true;
+  }
   if(request.action==='orderConfirmClicked') {
     announceConfirmedOrder(request,sender).then(sendResponse).catch(e=>sendResponse({sent:false,error:e.message}));return true;
   }

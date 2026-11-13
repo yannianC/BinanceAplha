@@ -144,6 +144,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
  * 在页面上执行交易操作
  * @param {Object} tradeInfo - 交易信息
  */
+function logTradeStep(trade,stage,details={}) {
+  try {void chrome.runtime.sendMessage({action:'pageLog',token:trade.token,attemptId:trade.id,stage,at:Date.now(),details}).catch(()=>{});}catch(_){}
+}
 async function executeTradeOnPage(tradeInfo) {
   const {url, price, amount, direction, coin, unionId, deadline:executionDeadline} = tradeInfo;
   if (activeTrade) return AlphaTrade.failure(unionId, 'ORDER_STATUS_UNKNOWN', '页面已有未完成的订单，请核对订单');
@@ -173,10 +176,12 @@ async function executeTradeOnPage(tradeInfo) {
       } catch(e) {
         trade.preparationErrors.push({attempt:attempt+1,at:Date.now(),message:e.message,formCheck:e.formCheck || null});
         if(attempt===1 || e.code!=='FORM_NOT_READY' || trade.clicked)throw e;
+        logTradeStep(trade,'form_retry',{attempt:attempt+1,message:e.message,formCheck:e.formCheck});
         // Exactly one refill, before submission; execution authority is checked again above.
       }
     }
     trade.formBeforeSubmit = captureOrderForm();
+    logTradeStep(trade,'form_ready',{expected:trade.expected,beforeSubmit:trade.formBeforeSubmit});
     checkAsset();
     // Arm the interceptor and wait for acknowledgment before allowing a click.
     bridgePost({type:'ALPHA_ARM_ORDER', unionId:trade.id});
@@ -184,6 +189,7 @@ async function executeTradeOnPage(tradeInfo) {
     while (!trade.armed && Date.now()<armDeadline) await sleep(25);
     if (!trade.armed) throw Error('订单回执拦截器未就绪，请刷新页面');
     await clickSubmitButton(direction, coin, () => {checkAsset();assertOrderForm(direction,price,amount);trade.clicked=true;});
+    if(trade.clicked)logTradeStep(trade,'submit_clicked');
     await sleep(100);
     // A direct API response ends the dialog wait immediately.
     await clickDialogConfirmButton(trade, checkAsset);
@@ -457,6 +463,7 @@ async function clickDialogConfirmButton(trade, checkAsset) {
             if(btn.isConnected===false || btn.disabled || btn.offsetParent===null)throw Error('确认按钮已不可用');
           });
           if(!clicked)return false;
+          logTradeStep(trade,'confirmation_clicked');
           // Notify immediately after the click; receipt/asset reporting remains independent.
           try {await chrome.runtime.sendMessage({action:'orderConfirmClicked',token:trade.token,attemptId:trade.id});}
           catch(e){console.warn('确认点击就绪通知失败:',e.message);}

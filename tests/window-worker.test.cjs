@@ -9,7 +9,7 @@ function fixture(){
  tabs:{query:async q=>tabs.filter(t=>(q.windowId===undefined || t.windowId===q.windowId)&&(!q.url || t.url.startsWith('https://www.binance.com/'))),get:async id=>{const t=tabs.find(t=>t.id===id);if(!t)throw Error('closed');return t},create:async data=>{const t={id:next++,status:'complete',...data};tabs.push(t);return t},update:async(id,x)=>Object.assign(tabs.find(t=>t.id===id),x),remove:async id=>{const i=tabs.findIndex(t=>t.id===id);if(i>=0)tabs.splice(i,1)},onUpdated:event(),onRemoved:event(),reload:async()=>{throw Error('reload should not be reached')},sendMessage:async(id,m)=>{sent.push({id,m});return m.action==='activatePage'?{protocol:7,authorized:true}:{healthy:true,canTrade:true,url:tabs.find(t=>t.id===id).url}}},
  webRequest:{onBeforeSendHeaders:event()},alarms:{create(){},onAlarm:event()},notifications:{create(){}}};
  class WebSocket{static OPEN=1;static CONNECTING=0;static CLOSED=3;static CLOSING=2;constructor(url){this.url=url;this.readyState=0;}close(){}}
- const ctx=vm.createContext({chrome,AlphaTrade,AlphaWindow,AlphaAssets,WebSocket,URL,crypto:require('node:crypto').webcrypto,console:{log(){},warn(){},error(){}},importScripts(){},setTimeout:()=>0,clearTimeout(){},setInterval:()=>0,clearInterval(){},out});
+ const ctx=vm.createContext({chrome,AlphaLocalLog:require('../local-log.js'),AlphaTrade,AlphaWindow,AlphaAssets,WebSocket,URL,crypto:require('node:crypto').webcrypto,console:{log(){},warn(){},error(){}},importScripts(){},setTimeout:()=>0,clearTimeout(){},setInterval:()=>0,clearInterval(){},out});
  vm.runInContext(fs.readFileSync('ws-config.js','utf8'),ctx);
  vm.runInContext(fs.readFileSync('background.js','utf8'),ctx);
  vm.runInContext('ws={readyState:1,send:m=>out.push(JSON.parse(m)),close(){}};',ctx);
@@ -231,4 +231,12 @@ for(const change of ['socket','coin','window'])test(`receiver recovery rejects c
 test('authorization denial does not trigger recovery refresh',async()=>{
  const f=await boundFixture();let reloads=0;f.ctx.chrome.tabs.reload=async()=>{reloads++};f.ctx.chrome.tabs.sendMessage=async()=>({protocol:7,authorized:false,error:'Denied'});
  await f.ctx.enqueueOrder(trade('denied'));assert.equal(reloads,0);assert.match(f.out.at(-1).data.orderData.message,/Denied/);
+});
+
+test('local log export is popup-only and persists correlated order events',async()=>{
+ const f=await boundFixture(),order=await pendingOrder(f);await order.notify();order.release();await order.done;
+ const denied=await f.message({action:'exportLocalLogs'},{url:'https://www.binance.com/en/alpha/bsc/0xaaa'});assert(denied.error);
+ const logs=await f.message({action:'exportLocalLogs'});assert(logs.persisted);assert(f.local.alphaLocalLogs.length>0);
+ for(const event of ['order_received','order_start','order_dispatch','isready_sent','order_result'])assert(logs.entries.some(e=>e.event===event && e.data.unionId==='a'),event);
+ assert(logs.entries.every(e=>typeof e.at==='number' && e.timestamp && e.beijingTime.endsWith('+08:00')));
 });
