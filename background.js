@@ -29,7 +29,7 @@ const assetReadiness = new AlphaAssets.AssetReadiness({
     const binding=await windowBinding.require();
     if(binding.token!==trade.bindingToken)return false;
     const [chainName,address]=AlphaTrade.assetKey(trade.url).split('/');
-    const result=await handlePageCommand({type:'refresh',data:{chainName,address}},{bindingToken:trade.bindingToken,socket:trade.socket});
+    const result=await handlePageCommand({type:'ready',data:{chainName,address}},{bindingToken:trade.bindingToken,socket:trade.socket});
     return result.healthy && result.canTrade;
   }
 });
@@ -509,18 +509,19 @@ function handleWebSocketMessage(message) {
 }
 
 async function handlePageCommand(message, expected = null) {
-  // Server naming is intentional: refresh probes readiness; ready reloads the page.
+  // refresh reloads and checks; ready only checks. Both acknowledge verified readiness.
   const compact = message.type === 'refresh' || message.type === 'ready';
-  const reload = message.type === 'ready' || message.type === 'refreshTradePage';
+  const reload = message.type === 'refresh' || message.type === 'refreshTradePage';
   const replySocket = ws;
   const {requestId,chainName,address}=message.data || {};
   const result={requestId,healthy:false,canTrade:false,checkedAt:Date.now(),instanceId:chrome.runtime.id};
-  let locked=false;
+  let locked=false,checkedBindingToken=null;
   try {
     if((!compact && (typeof requestId!=='string' || !requestId)) || !/^[a-z0-9_-]+$/i.test(chainName || '') || !/^[a-z0-9_-]+$/i.test(address || '')) throw Error('无效检查参数');
     if(isBusy())throw Error('BUSY: 正在下单或维护，不能检查切页或刷新');
     maintenance=true;locked=true;
     const binding=await windowBinding.require();
+    checkedBindingToken=binding.token;
     if(expected && (binding.token!==expected.bindingToken || ws!==expected.socket))throw Error('窗口或连接已变化');
     const url=`https://www.binance.com/zh-CN/alpha/${chainName}/${address}`;
     const tab=await findTabByUrl(url);
@@ -538,13 +539,20 @@ async function handlePageCommand(message, expected = null) {
     Object.assign(result,page);
     result.windowId=binding.windowId;
   } catch(e){result.healthy=false;result.canTrade=false;result.error=e.message;}
-  finally {if(locked){maintenance=false;void assetReadiness.flush();}}
+  finally {if(locked)maintenance=false;}
   result.checkedAt=Date.now();
   if(replySocket === ws && replySocket?.readyState===WebSocket.OPEN) {
     if(!compact) replySocket.send(JSON.stringify({type:message.type+'Result',data:result}));
-    else if(message.type==='refresh' && result.healthy && result.canTrade) replySocket.send(JSON.stringify({type:'isready'}));
+    else if(result.healthy && result.canTrade) {
+      replySocket.send(JSON.stringify({type:'isready'}));
+      // This check also satisfies a pending post-trade check for the same page.
+      const ticket=assetReadiness.pending;
+      if(ticket && ticket.trade.socket===replySocket && ticket.trade.bindingToken===checkedBindingToken &&
+          AlphaTrade.assetKey(ticket.trade.url)===AlphaTrade.assetKey(result.url)) assetReadiness.acknowledge(ticket);
+    }
   }
-  // Compact protocol has no error/refresh acknowledgement; keep diagnostics local.
+  if(locked)void assetReadiness.flush();
+  // Compact protocol only acknowledges readiness; keep failures local.
   if(compact && result.error) console.warn('页面指令未就绪:',message.type,result.error);
   return result;
 }

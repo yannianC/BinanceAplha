@@ -14,6 +14,7 @@
     constructor({busy,check,now=Date.now}){this.busy=busy;this.check=check;this.now=now;this.key=null;this.revision=0;this.generation=0;this.pending=null;this.checking=false;}
     begin(trade){this.pending=null;return {trade,generation:++this.generation,revision:this.revision,at:this.now()};}
     finish(ticket,success){if(ticket.generation===this.generation){if(success)ticket.at=this.now();this.pending=success?ticket:null;}}
+    acknowledge(ticket){if(this.pending===ticket)this.pending=null;}
     async observe(response){
       const key=balanceKey(response);
       if(key===null)return;

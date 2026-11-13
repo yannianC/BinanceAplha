@@ -39,7 +39,7 @@ test('changing connection reserves maintenance before storage await; incoming or
  assert.equal(f.sent.length,0);assert.equal(f.out.at(-1).data.orderData.code,'INVALID_ORDER');
  release();assert.equal((await change).success,true);
 });
-test('refresh command refuses while order acceptance is awaiting binding',async()=>{
+test('legacy refresh command refuses while order acceptance is awaiting binding',async()=>{
  const f=fixture();await f.message({action:'bindWindow',windowId:1});
  vm.runInContext('acceptingOrders=1;',f.ctx);
  const r=await f.ctx.handlePageCommand({type:'refreshTradePage',data:{requestId:'r',chainName:'bsc',address:'0xaaa'}});
@@ -47,31 +47,31 @@ test('refresh command refuses while order acceptance is awaiting binding',async(
 });
 const coin={chainName:'bsc',address:'0x5dbde81fce337ff4bcaaee4ca3466c00aecae274'};
 async function boundFixture(){const f=fixture();await f.message({action:'bindWindow',windowId:1});f.tabs.push({id:90,windowId:1,url:'https://www.binance.com/en/alpha/'+coin.chainName+'/'+coin.address,status:'complete'});return f;}
-test('refresh checks readiness without requestId and replies exactly isready',async()=>{const f=await boundFixture();await f.ctx.handleWebSocketMessage({type:'refresh',data:coin});assert.deepEqual(structuredClone(f.out),[{type:'isready'}]);});
-test('refresh sends no positive reply when busy, malformed, or page unhealthy',async()=>{
- const f=await boundFixture();vm.runInContext('acceptingOrders=1;',f.ctx);await f.ctx.handleWebSocketMessage({type:'refresh',data:coin});vm.runInContext('acceptingOrders=0;',f.ctx);
- await f.ctx.handleWebSocketMessage({type:'refresh',data:{...coin,address:'../bad'}});
+test('ready checks readiness without requestId and replies exactly isready',async()=>{const f=await boundFixture();await f.ctx.handleWebSocketMessage({type:'ready',data:coin});assert.deepEqual(structuredClone(f.out),[{type:'isready'}]);});
+test('ready sends no positive reply when busy, malformed, or page unhealthy',async()=>{
+ const f=await boundFixture();vm.runInContext('acceptingOrders=1;',f.ctx);await f.ctx.handleWebSocketMessage({type:'ready',data:coin});vm.runInContext('acceptingOrders=0;',f.ctx);
+ await f.ctx.handleWebSocketMessage({type:'ready',data:{...coin,address:'../bad'}});
  f.ctx.chrome.tabs.sendMessage=async(_,m)=>m.action==='activatePage'?{protocol:4,authorized:true}:{healthy:false,canTrade:false,url:f.tabs.at(-1).url};
- await f.ctx.handleWebSocketMessage({type:'refresh',data:coin});assert.equal(f.out.length,0);
+ await f.ctx.handleWebSocketMessage({type:'ready',data:coin});assert.equal(f.out.length,0);
 });
-test('ready reloads only bound coin and sends no explicit WebSocket response',async()=>{
+test('refresh reloads only bound coin and replies exactly isready',async()=>{
  const f=await boundFixture(),reloaded=[];
  f.ctx.chrome.tabs.reload=async id=>{reloaded.push(id);f.ctx.chrome.tabs.onUpdated.emit(id,{status:'complete'});};
- await f.ctx.handleWebSocketMessage({type:'ready',data:coin});assert.deepEqual(reloaded,[90]);assert.equal(f.out.length,0);
+ await f.ctx.handleWebSocketMessage({type:'refresh',data:coin});assert.deepEqual(reloaded,[90]);assert.deepEqual(structuredClone(f.out),[{type:'isready'}]);
 });
-test('ready never reloads during an order and never sends a special error response',async()=>{const f=await boundFixture();vm.runInContext('acceptingOrders=1;',f.ctx);await f.ctx.handleWebSocketMessage({type:'ready',data:coin});assert.equal(f.out.length,0);assert.equal(f.sent.length,0);});
-test('post-refresh asset event still uploads over HTTP without WebSocket acknowledgement',async()=>{
+test('refresh never reloads during an order and never sends a special error response',async()=>{const f=await boundFixture();vm.runInContext('acceptingOrders=1;',f.ctx);await f.ctx.handleWebSocketMessage({type:'refresh',data:coin});assert.equal(f.out.length,0);assert.equal(f.sent.length,0);});
+test('post-refresh asset event uploads over HTTP without an additional WebSocket acknowledgement',async()=>{
  const f=await boundFixture(),uploads=[];f.local.browserNumber='23';
  f.ctx.fetch=async(url,options)=>{uploads.push({url,body:JSON.parse(options.body)});return {ok:true,status:200,text:async()=>''}};
  f.ctx.chrome.tabs.reload=async id=>f.ctx.chrome.tabs.onUpdated.emit(id,{status:'complete'});
- await f.ctx.handleWebSocketMessage({type:'ready',data:coin});
+ await f.ctx.handleWebSocketMessage({type:'refresh',data:coin});
  await f.message({action:'alphaAssetsData',token:f.session.windowBinding.token,data:{url:'https://www.binance.com/bapi/defi/v1/private/wallet-direct/cloud-wallet/alpha',data:{code:'000000',data:{list:[],totalValuation:'0'}}}},{tab:{id:90},frameId:0,url:f.tabs.at(-1).url});
- assert.equal(uploads.length,1);assert.equal(uploads[0].body.name,'23');assert.equal(f.out.length,0);
+ assert.equal(uploads.length,1);assert.equal(uploads[0].body.name,'23');assert.deepEqual(structuredClone(f.out),[{type:'isready'}]);
 });
 test('check started on an old socket cannot send isready on a replacement connection',async()=>{
  const f=await boundFixture();let release;const original=f.ctx.chrome.tabs.sendMessage;
  f.ctx.chrome.tabs.sendMessage=async(id,m)=>{if(m.action==='checkReady')await new Promise(r=>release=r);return original(id,m)};
- const checking=f.ctx.handleWebSocketMessage({type:'refresh',data:coin});await new Promise(r=>setImmediate(r));
+ const checking=f.ctx.handleWebSocketMessage({type:'ready',data:coin});await new Promise(r=>setImmediate(r));
  vm.runInContext('ws={readyState:1,send:m=>out.push(JSON.parse(m))};',f.ctx);release();await checking;assert.equal(f.out.length,0);
 });
 const wallet=free=>({code:'000000',data:{list:[{chainId:'56',contractAddress:coin.address,free,freeze:'0',amount:free}]}});
@@ -93,10 +93,10 @@ test('server retry executes again and can notify readiness; failed attempt canno
 test('post-trade automatic readiness fails closed after socket or binding changes',async()=>{
  const f=await boundFixture();successfulTrades(f);await observe(f,'1');await f.ctx.enqueueOrder(trade('a'));vm.runInContext('ws={readyState:1,send:m=>out.push(JSON.parse(m))};',f.ctx);await observe(f,'2');assert.equal(f.out.filter(m=>m.type==='isready').length,0);
 });
-test('asset change during maintenance triggers automatic recheck when refresh releases its lock',async()=>{
+test('refresh readiness satisfies pending post-trade notification without duplicate isready',async()=>{
  const f=await boundFixture();successfulTrades(f);await observe(f,'1');await f.ctx.enqueueOrder(trade('a'));
  f.ctx.chrome.tabs.reload=async id=>{await observe(f,'2');assert.equal(f.out.filter(m=>m.type==='isready').length,0);f.ctx.chrome.tabs.onUpdated.emit(id,{status:'complete'});};
- await f.ctx.handleWebSocketMessage({type:'ready',data:coin});await new Promise(r=>setImmediate(r));assert.equal(f.out.filter(m=>m.type==='isready').length,1);
+ await f.ctx.handleWebSocketMessage({type:'refresh',data:coin});await new Promise(r=>setImmediate(r));assert.equal(f.out.filter(m=>m.type==='isready').length,1);
 });
 
 for (const [instance,account] of [['23-1','23'],['23-2','23'],['23-3','23'],['22-1','22'],['22-2','22'],['23','23']]) {
@@ -137,4 +137,18 @@ test('popup status follows actual socket lifecycle and ignores old socket events
  const current=vm.runInContext('ws',f.ctx);current.readyState=3;current.onclose({code:1000});
  assert.equal(updates.at(-1).connected,false);
  assert.equal((await f.message({action:'getConnectionStatus'})).readyState,3);
+});
+
+test('refresh failure or unhealthy page never announces readiness',async()=>{
+ for(const failure of ['reload','unhealthy']){
+  const f=await boundFixture();
+  f.ctx.chrome.tabs.reload=async id=>{if(failure==='reload')throw Error('reload failed');f.ctx.chrome.tabs.onUpdated.emit(id,{status:'complete'});};
+  f.ctx.chrome.tabs.sendMessage=async(_,m)=>m.action==='activatePage'?{protocol:4,authorized:true}:{healthy:false,canTrade:false,url:f.tabs.at(-1).url};
+  await f.ctx.handleWebSocketMessage({type:'refresh',data:coin});assert.equal(f.out.length,0);
+ }
+});
+test('refresh cannot acknowledge on a replacement socket',async()=>{
+ const f=await boundFixture();
+ f.ctx.chrome.tabs.reload=async id=>{vm.runInContext('ws={readyState:1,send:m=>out.push(JSON.parse(m))};',f.ctx);f.ctx.chrome.tabs.onUpdated.emit(id,{status:'complete'});};
+ await f.ctx.handleWebSocketMessage({type:'refresh',data:coin});assert.equal(f.out.length,0);
 });
