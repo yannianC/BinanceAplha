@@ -11,7 +11,7 @@ function routing(tabs) {
   query:async q=>tabs.filter(t=>t.windowId===q.windowId),create:async t=>{const tab={...t,id:tabs.length+1,status:'complete'};tabs.push(tab);created.push(tab);return tab},
   get:async id=>{const tab=tabs.find(t=>t.id===id);if(!tab)throw Error('closed');return tab},
   update:async(id,values)=>{const tab=tabs.find(t=>t.id===id);Object.assign(tab,values);return tab},
-  sendMessage:async(id,msg)=>msg.action==='activatePage'?{protocol:6,authorized:true}:(sent.push({id,msg}),{protocol:6,data:{unionId:msg.data.unionId,bnResp:1,orderData:{code:'000000'}}})
+  sendMessage:async(id,msg)=>msg.action==='activatePage'?{protocol:7,authorized:true}:(sent.push({id,msg}),{protocol:7,data:{unionId:msg.data.unionId,bnResp:1,orderData:{code:'000000'}}})
  }};
  const windowBinding={require:async()=>({windowId:1,token:"t"}),authorize:async id=>{if((await chrome.tabs.get(id)).windowId!==1)throw Error("wrong window")}};
  const ctx=vm.createContext({chrome,windowBinding,AlphaTrade,console:silent,setTimeout,clearTimeout,Date,URL,crypto:require('node:crypto').webcrypto});
@@ -219,4 +219,37 @@ test('confirmation announces only after an actual successful click',async()=>{
   assert.equal(sent.filter(m=>m.action==='orderConfirmClicked').length,mode==='clicked'?1:0,mode);
   if(mode==='clicked')assert.equal(clicks,1);
  }
+});
+
+function timedForm({step=16,priceAt=()=> '0.05040560',lockedAt=()=>false,buttonAt=()=>true}={}) {
+ let now=0;const s=fs.readFileSync('content.js','utf8');const ctx=vm.createContext({Date:{now:()=>now}});
+ vm.runInContext(s.slice(s.indexOf('function normalizedFormNumber'),s.indexOf('async function clickSubmitButton')),ctx);
+ ctx.document={getElementById:id=>id==='bn-tab-LIMIT'?{classList:{contains:()=>true}}:{get value(){return id==='limitPrice'?priceAt(now):'15,535'},get disabled(){return lockedAt(now)},readOnly:false,offsetParent:{}},querySelectorAll:selector=>selector==='.bn-tab__buySell'?[{textContent:'买入',offsetParent:{},classList:{contains:()=>true}}]:[{textContent:'买入 AAA',offsetParent:{},get disabled(){return !buttonAt(now)}}]};
+ ctx.waitForFormUpdate=async()=>{now+=step};return {ctx,now:()=>now};
+}
+test('correct form survives 1 second background scheduling intervals',async()=>{
+ const f=timedForm({step:1000});await f.ctx.waitForOrderForm('Buy','0.05040560','15535','AAA');assert.equal(f.now(),2000);
+});
+test('price synchronization may complete after one second with button available',async()=>{
+ const f=timedForm({priceAt:t=>t<1200?'0.05':'0.05040560'});await f.ctx.waitForOrderForm('Buy','0.05040560','15535','AAA');assert(f.now()>=1200);assert(f.now()<1500);
+});
+test('button unavailable for one second returns a retryable failure',async()=>{
+ const f=timedForm({buttonAt:()=>false});await assert.rejects(f.ctx.waitForOrderForm('Buy','0.05040560','15535','AAA'),e=>e.code==='FORM_NOT_READY');assert(f.now()>=1000 && f.now()<1100);
+});
+test('persistent price mismatch returns retryable snapshot with expected and actual values',async()=>{
+ const f=timedForm({priceAt:()=> '0.05'});await assert.rejects(f.ctx.waitForOrderForm('Buy','0.05040560','15535','AAA'),e=>e.code==='FORM_NOT_READY' && e.formCheck.expected==='0.05040560' && e.formCheck.actual==='0.05');
+});
+test('same price in locked input reports locked state and can retry',async()=>{
+ const f=timedForm({lockedAt:()=>true});await assert.rejects(f.ctx.waitForOrderForm('Buy','0.05040560','15535','AAA'),e=>e.code==='FORM_NOT_READY' && e.formCheck.disabled===true && e.formCheck.actual===e.formCheck.expected);
+});
+
+for(const recovers of [true,false])test(`real price mismatch ${recovers?'recovers on one refill':'reports both failed checks'}`,async()=>{
+ const {ctx,emit}=pageFixture();let fills=0,clicks=0;
+ const f=timedForm({priceAt:()=>recovers && fills>=4?'0.05040560':'0.05'});
+ ctx.setInputValue=async()=>{fills++};ctx.waitForOrderForm=(...args)=>f.ctx.waitForOrderForm(...args);
+ ctx.clickSubmitButton=async(_,__,before)=>{before();clicks++;emit({type:'FETCH_RESPONSE',unionId:'sync',data:{code:'000000'}})};
+ ctx.clickDialogConfirmButton=async()=>{};
+ const result=await ctx.executeTradeOnPage({bindingToken:'t',url:ctx.location.href,unionId:'sync',price:'0.05040560',amount:'15535',direction:'Buy',coin:'AAA',deadline:Date.now()+80000});
+ assert.equal(fills,4);assert.equal(clicks,recovers?1:0);assert.equal(result.orderData.code,recovers?'000000':'EXECUTION_ERROR');
+ if(!recovers){const d=result.orderData.pageDiagnostics;assert.equal(d.expected.price,'0.05040560');assert.equal(d.preparationErrors.length,2);assert.equal(d.preparationErrors[0].formCheck.actual,'0.05');}
 });

@@ -38,7 +38,7 @@ async function activatePage() {
   });
   await injectionPromise;
   bridgePost({type:'ALPHA_ENABLE'});
-  return {protocol:6,authorized:true};
+  return {protocol:7,authorized:true};
 }
 // Unbound copies remain inert and do not install page-world interceptors.
 activatePage().catch(()=>{});
@@ -123,18 +123,18 @@ window.addEventListener('message', (event) => {
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'activatePage') {
-    activatePage().then(sendResponse).catch(e=>sendResponse({protocol:6,authorized:false,error:e.message}));return true;
+    activatePage().then(sendResponse).catch(e=>sendResponse({protocol:7,authorized:false,error:e.message}));return true;
   }
   if (request.action === 'checkReady') {
     checkPageReady().then(sendResponse).catch(e=>sendResponse({healthy:false,canTrade:false,error:e.message}));return true;
   }
   if (request.action === 'ping') {
     // 响应ping消息，表示content script已就绪
-    sendResponse({ success: true, ready: true, protocol:6 });
+    sendResponse({ success: true, ready: true, protocol:7 });
     return true;
   } else if (request.action === 'executeTrade') {
     executeTradeOnPage(request.data)
-      .then(data => sendResponse({ protocol:6, data }))
+      .then(data => sendResponse({ protocol:7, data }))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true; // 保持消息通道打开
   }
@@ -147,7 +147,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 async function executeTradeOnPage(tradeInfo) {
   const {url, price, amount, direction, coin, unionId, deadline:executionDeadline} = tradeInfo;
   if (activeTrade) return AlphaTrade.failure(unionId, 'ORDER_STATUS_UNKNOWN', '页面已有未完成的订单，请核对订单');
-  const trade = {id:tradeInfo.attemptId || unionId, unionId, armed:false, receipt:null, clicked:false,token:tradeInfo.bindingToken,deadline:executionDeadline,url};
+  const trade = {id:tradeInfo.attemptId || unionId, unionId, armed:false, receipt:null, clicked:false,token:tradeInfo.bindingToken,deadline:executionDeadline,url,expected:{price,amount,direction,coin},preparationErrors:[]};
   activeTrade = trade;
   try {
     if(!pageBinding || pageBinding!==trade.token)throw Error('窗口绑定已变化');
@@ -161,23 +161,20 @@ async function executeTradeOnPage(tradeInfo) {
     await clickKnowItButton();
     await clickTradeTab(direction);
     await ensureLimitOrderTab();
-    const prepareForm=async()=>{
-      await checkPageAuthority(trade.token);
-      await setInputValue('limitPrice', price);
-      await checkPageAuthority(trade.token);
-      await setInputValue('limitAmount', amount);
-      await waitForOrderForm(direction,price,amount,coin);
-    };
-    try {await prepareForm();}
-    catch(e) {
-      if(e.code!=='FORM_NOT_READY' || trade.clicked)throw e;
-      // One bounded refill only before submission. Authority/coin/deadline stay enforced.
-      checkAsset();
-      await checkPageAuthority(trade.token);
-      await setInputValue('limitPrice', price);
-      await checkPageAuthority(trade.token);
-      await setInputValue('limitAmount', amount);
-      await waitForOrderForm(direction,price,amount,coin);
+    for(let attempt=0;attempt<2;attempt++) {
+      try {
+        await checkPageAuthority(trade.token);checkAsset();
+        if(attempt)await ensureLimitOrderTab();
+        await setInputValue('limitPrice', price);
+        await checkPageAuthority(trade.token);checkAsset();
+        await setInputValue('limitAmount', amount);
+        await waitForOrderForm(direction,price,amount,coin);
+        break;
+      } catch(e) {
+        trade.preparationErrors.push({attempt:attempt+1,at:Date.now(),message:e.message,formCheck:e.formCheck || null});
+        if(attempt===1 || e.code!=='FORM_NOT_READY' || trade.clicked)throw e;
+        // Exactly one refill, before submission; execution authority is checked again above.
+      }
     }
     trade.formBeforeSubmit = captureOrderForm();
     checkAsset();
@@ -272,7 +269,7 @@ async function setInputValue(inputId, value) {
   // Bypass React's own value tracker so the input event reaches its form state.
   for (const next of ['', String(value)]) {
     const input = await waitForElement(`#${inputId}`, 10000);
-    if(input.disabled || input.readOnly)throw Error('交易输入框不可编辑');
+    if(input.disabled || input.readOnly)throw formNotReady('交易输入框不可编辑',inputState(inputId,value,input));
     input.focus();
     nativeSetter.call(input,next);
     input.dispatchEvent(new Event('input',{bubbles:true}));
@@ -298,6 +295,13 @@ function normalizedFormNumber(value) {
   const [whole,fraction='']=text.split('.');
   return (whole.replace(/^0+(?=\d)/,'') || '0')+'.'+fraction.replace(/0+$/,'');
 }
+function formNotReady(message,formCheck) {
+  const error=Error(message);error.code='FORM_NOT_READY';error.formCheck=formCheck;return error;
+}
+function inputState(id,expected,input) {
+  return {id,expected:String(expected),actual:input?.value ?? null,exists:!!input,
+    disabled:!!input?.disabled,readOnly:!!input?.readOnly,visible:!!input && input.offsetParent!==null};
+}
 function findSubmitButton(direction,coin) {
   const buttonClass=direction==='Buy'?'bn-button__buy':'bn-button__sell';
   return Array.from(document.querySelectorAll(`button[class*="${buttonClass}"]`))
@@ -315,22 +319,33 @@ function assertOrderForm(direction,price,amount) {
   if(!document.getElementById('bn-tab-LIMIT')?.classList.contains('active'))throw Error('限价表单尚未就绪');
   for(const [id,value] of [['limitPrice',price],['limitAmount',amount]]) {
     const input=document.getElementById(id);
-    if(!input || input.disabled || input.readOnly || normalizedFormNumber(input.value)===null || normalizedFormNumber(input.value)!==normalizedFormNumber(value))throw Error('表单数值未同步：'+id);
+    const state=inputState(id,value,input);
+    if(!state.exists || !state.visible || state.disabled || state.readOnly)throw formNotReady('交易输入框不可编辑：'+id,state);
+    if(normalizedFormNumber(state.actual)===null || normalizedFormNumber(state.actual)!==normalizedFormNumber(state.expected))throw formNotReady('表单数值未同步：'+id,state);
   }
 }
 async function waitForOrderForm(direction,price,amount,coin) {
-  const deadline=Date.now()+1000;let stable=0,lastError;
+  const started=Date.now(),deadline=started+3000;
+  let stable=0,lastError,buttonBlockedSince=null;
   while(Date.now()<deadline) {
+    const buttonReady=!!findSubmitButton(direction,coin);
+    if(buttonReady)buttonBlockedSince=null;
+    else if(buttonBlockedSince===null)buttonBlockedSince=Date.now();
     try {
       assertOrderForm(direction,price,amount);
-      if(!findSubmitButton(direction,coin)){const e=Error('提交按钮尚未就绪');e.code='FORM_NOT_READY';throw e;}
+      if(!buttonReady)throw formNotReady('提交按钮尚未就绪');
+      lastError=null;
       stable++;if(stable>=3)return;
-    }
-    catch(e){stable=0;lastError=e;}
+    } catch(e){stable=0;lastError=e;}
+    // The one-second limit applies to button availability, not all three render checks.
+    if(buttonBlockedSince!==null && Date.now()-buttonBlockedSince>=1000)
+      throw formNotReady('提交按钮持续1秒不可用',lastError?.formCheck);
     await waitForFormUpdate();
   }
-  throw lastError || Error('交易表单未稳定');
+  if(lastError)throw lastError;
+  throw formNotReady('交易表单稳定检查超时',{stableChecks:stable,elapsedMs:Date.now()-started});
 }
+
 function captureOrderForm() {
   const values={};
   for(const id of ['limitPrice','limitAmount','limitTotal'])values[id]=document.getElementById(id)?.value || '';
@@ -343,7 +358,7 @@ function captureOrderForm() {
 }
 function attachOrderDiagnostics(result,trade) {
   if(String(result?.orderData?.code)==='000000')return result;
-  try {result.orderData={...result.orderData,pageDiagnostics:{beforeSubmit:trade.formBeforeSubmit || null,after:captureOrderForm()}};}catch(_){}
+  try {result.orderData={...result.orderData,pageDiagnostics:{expected:trade.expected,preparationErrors:trade.preparationErrors,beforeSubmit:trade.formBeforeSubmit || null,after:captureOrderForm()}};}catch(_){}
   return result;
 }
 

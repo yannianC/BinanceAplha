@@ -657,7 +657,7 @@ async function executeTrade(tradeInfo) {
     dispatch.tabId=tabId;activeDispatch=dispatch;
     dispatched = true;
     const result = await withTimeout(chrome.tabs.sendMessage(tabId, {action:'executeTrade',data:{...tradeInfo, attemptId:dispatch.attemptId, deadline:Date.now()+80000}}), 90000);
-    if (!result || result.protocol !== 6 || !result.data) throw Error('页面返回了旧版或无效回执');
+    if (!result || result.protocol !== 7 || !result.data) throw Error('页面返回了旧版或无效回执');
     return result.data;
   } catch (e) {
     return AlphaTrade.failure(tradeInfo.unionId, dispatched ? 'ORDER_STATUS_UNKNOWN' : 'PAGE_NOT_READY', e.message);
@@ -711,7 +711,7 @@ function sleep(ms) {
  */
 async function ensureContentScriptLoaded(tabId) {
   const reply = await chrome.tabs.sendMessage(tabId, {action:'activatePage'});
-  if (reply?.protocol !== 6 || !reply.authorized) throw Error('请刷新币安标签页以加载新版插件');
+  if (reply?.protocol !== 7 || !reply.authorized) throw Error('请刷新币安标签页以加载新版插件');
 }
 
 /**

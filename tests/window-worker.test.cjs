@@ -6,7 +6,7 @@ function fixture(){
  const event=()=>{const listeners=new Set();return {addListener:f=>listeners.add(f),removeListener:f=>listeners.delete(f),emit:(...args)=>{for(const f of listeners)f(...args)}}};
  const chrome={runtime:{id:'aaa',getURL:p=>'chrome-extension://aaa/'+p,onMessage:{addListener:f=>events.message=f},onInstalled:event(),onStartup:event(),sendMessage:()=>Promise.resolve()},
  storage:{local:{get:async()=>local,set:async x=>{await saveHook(x);Object.assign(local,x)},remove:async k=>delete local[k]},session:{get:async()=>session,set:async x=>Object.assign(session,x)}},
- tabs:{query:async q=>tabs.filter(t=>(q.windowId===undefined || t.windowId===q.windowId)&&(!q.url || t.url.startsWith('https://www.binance.com/'))),get:async id=>{const t=tabs.find(t=>t.id===id);if(!t)throw Error('closed');return t},create:async data=>{const t={id:next++,status:'complete',...data};tabs.push(t);return t},update:async(id,x)=>Object.assign(tabs.find(t=>t.id===id),x),remove:async id=>{const i=tabs.findIndex(t=>t.id===id);if(i>=0)tabs.splice(i,1)},onUpdated:event(),onRemoved:event(),reload:async()=>{throw Error('reload should not be reached')},sendMessage:async(id,m)=>{sent.push({id,m});return m.action==='activatePage'?{protocol:6,authorized:true}:{healthy:true,canTrade:true,url:tabs.find(t=>t.id===id).url}}},
+ tabs:{query:async q=>tabs.filter(t=>(q.windowId===undefined || t.windowId===q.windowId)&&(!q.url || t.url.startsWith('https://www.binance.com/'))),get:async id=>{const t=tabs.find(t=>t.id===id);if(!t)throw Error('closed');return t},create:async data=>{const t={id:next++,status:'complete',...data};tabs.push(t);return t},update:async(id,x)=>Object.assign(tabs.find(t=>t.id===id),x),remove:async id=>{const i=tabs.findIndex(t=>t.id===id);if(i>=0)tabs.splice(i,1)},onUpdated:event(),onRemoved:event(),reload:async()=>{throw Error('reload should not be reached')},sendMessage:async(id,m)=>{sent.push({id,m});return m.action==='activatePage'?{protocol:7,authorized:true}:{healthy:true,canTrade:true,url:tabs.find(t=>t.id===id).url}}},
  webRequest:{onBeforeSendHeaders:event()},alarms:{create(){},onAlarm:event()},notifications:{create(){}}};
  class WebSocket{static OPEN=1;static CONNECTING=0;static CLOSED=3;static CLOSING=2;constructor(url){this.url=url;this.readyState=0;}close(){}}
  const ctx=vm.createContext({chrome,AlphaTrade,AlphaWindow,AlphaAssets,WebSocket,URL,crypto:require('node:crypto').webcrypto,console:{log(){},warn(){},error(){}},importScripts(){},setTimeout:()=>0,clearTimeout(){},setInterval:()=>0,clearInterval(){},out});
@@ -52,7 +52,7 @@ test('ready checks readiness without requestId and replies exactly isready',asyn
 test('ready sends no positive reply when busy, malformed, or page unhealthy',async()=>{
  const f=await boundFixture();vm.runInContext('acceptingOrders=1;',f.ctx);await f.ctx.handleWebSocketMessage({type:'ready',data:coin});vm.runInContext('acceptingOrders=0;',f.ctx);
  await f.ctx.handleWebSocketMessage({type:'ready',data:{...coin,address:'../bad'}});
- f.ctx.chrome.tabs.sendMessage=async(_,m)=>m.action==='activatePage'?{protocol:6,authorized:true}:{healthy:false,canTrade:false,url:f.tabs.at(-1).url};
+ f.ctx.chrome.tabs.sendMessage=async(_,m)=>m.action==='activatePage'?{protocol:7,authorized:true}:{healthy:false,canTrade:false,url:f.tabs.at(-1).url};
  await f.ctx.handleWebSocketMessage({type:'ready',data:coin});assert.equal(f.out.length,0);
 });
 test('refresh reloads only bound coin and replies exactly isready',async()=>{
@@ -78,7 +78,7 @@ test('check started on an old socket cannot send isready on a replacement connec
 const trade=id=>({...coin,unionId:id,amt:'1',price:'1',symbol:'AAA'});
 async function pendingOrder(f){
  let release,dispatch;const original=f.ctx.chrome.tabs.sendMessage;
- f.ctx.chrome.tabs.sendMessage=async(id,m)=>{if(m.action!=='executeTrade')return original(id,m);dispatch={id,m};await new Promise(r=>release=r);return {protocol:6,data:{unionId:m.data.unionId,bnResp:1,orderData:{code:'000000'}}}};
+ f.ctx.chrome.tabs.sendMessage=async(id,m)=>{if(m.action!=='executeTrade')return original(id,m);dispatch={id,m};await new Promise(r=>release=r);return {protocol:7,data:{unionId:m.data.unionId,bnResp:1,orderData:{code:'000000'}}}};
  const done=f.ctx.enqueueOrder(trade('a'));await new Promise(r=>setImmediate(r));
  return {done,release,notify:(changes={},senderChanges={})=>f.message({action:'orderConfirmClicked',token:dispatch.m.data.bindingToken,attemptId:dispatch.m.data.attemptId,...changes},{tab:{id:dispatch.id},frameId:0,url:dispatch.m.data.url,...senderChanges})};
 }
@@ -144,7 +144,7 @@ test('refresh failure or unhealthy page never announces readiness',async()=>{
  for(const failure of ['reload','unhealthy']){
   const f=await boundFixture();
   f.ctx.chrome.tabs.reload=async id=>{if(failure==='reload')throw Error('reload failed');f.ctx.chrome.tabs.onUpdated.emit(id,{status:'complete'});};
-  f.ctx.chrome.tabs.sendMessage=async(_,m)=>m.action==='activatePage'?{protocol:6,authorized:true}:{healthy:false,canTrade:false,url:f.tabs.at(-1).url};
+  f.ctx.chrome.tabs.sendMessage=async(_,m)=>m.action==='activatePage'?{protocol:7,authorized:true}:{healthy:false,canTrade:false,url:f.tabs.at(-1).url};
   await f.ctx.handleWebSocketMessage({type:'refresh',data:coin});assert.equal(f.out.length,0);
  }
 });
@@ -163,7 +163,7 @@ test('ready opens missing coin in its own window then reuses it on the next requ
 });
 test('ready waits for SPA form after document complete before reporting ready',async()=>{
  const f=await boundFixture();let checks=0;
- f.ctx.chrome.tabs.sendMessage=async(_,m)=>m.action==='activatePage'?{protocol:6,authorized:true}:{healthy:++checks>=3,canTrade:checks>=3,url:f.tabs.at(-1).url};
+ f.ctx.chrome.tabs.sendMessage=async(_,m)=>m.action==='activatePage'?{protocol:7,authorized:true}:{healthy:++checks>=3,canTrade:checks>=3,url:f.tabs.at(-1).url};
  await f.ctx.handleWebSocketMessage({type:'ready',data:coin});assert.equal(checks,3);assert.equal(f.out.at(-1).type,'isready');
 });
 test('ready recovers a missing content receiver with one bound page reload',async()=>{
