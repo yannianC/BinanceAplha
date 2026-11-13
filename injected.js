@@ -19,6 +19,21 @@
 
   // ============ 目标接口 ============
   const ORDER_PLACE_PATH = '/bapi/asset/v1/private/alpha-trade/order/place';
+  let armedOrder = null;
+  window.addEventListener('message', event => {
+    if (event.source !== window || !event.data) return;
+    if (event.data.type === 'ALPHA_ARM_ORDER') {
+      armedOrder = event.data.unionId;
+      window.postMessage({type:'ALPHA_ORDER_ARMED',unionId:armedOrder}, '*');
+    } else if (event.data.type === 'ALPHA_DISARM_ORDER' && armedOrder === event.data.unionId) armedOrder = null;
+  });
+  function takeOrderId(url) {
+    if (!url.includes(ORDER_PLACE_PATH)) return null;
+    const id = armedOrder;
+    armedOrder = null;
+    return id;
+  }
+
   // 需要捕获请求头的私有接口（资产相关）
   const HEADER_CAPTURE_MATCHES = [
     '/bapi/defi/v1/private/wallet-direct/cloud-wallet/alpha'
@@ -95,6 +110,7 @@
       }
     }
 
+    const orderId = takeOrderId(url);
     return originalFetch.apply(this, args).then(response => {
       // 克隆response以便我们可以读取它
       const clonedResponse = response.clone();
@@ -107,6 +123,7 @@
           // 将响应数据发送到页面
           window.postMessage({
             type: 'FETCH_RESPONSE',
+            unionId: orderId,
             url: url,
             data: data
           }, '*');
@@ -160,6 +177,7 @@
   };
 
   XMLHttpRequest.prototype.send = function(...args) {
+    const orderId = takeOrderId(this._url || "");
     // 捕获请求头 + 响应体（资产接口）
     if (this._url && shouldCaptureHeaders(this._url)) {
       try {
@@ -187,6 +205,7 @@
           console.log('%cXHR响应数据:', 'color: red; font-size: 14px;', data);
           window.postMessage({
             type: 'FETCH_RESPONSE',
+            unionId: orderId,
             url: this._url,
             data: data
           }, '*');

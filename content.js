@@ -4,7 +4,7 @@
  */
 
 // 存储当前交易的unionId
-let currentUnionId = null;
+let activeTrade = null;
 
 console.log('币安Alpha交易助手 - Content Script已加载');
 
@@ -34,7 +34,7 @@ function injectInterceptorScript() {
  * 监听页面发送的消息（fetch拦截结果）
  */
 window.addEventListener('message', (event) => {
-  if (event.source !== window) return;
+  if (event.source !== window || !event.data) return;
   
   if (event.data.type === 'ALPHA_HEADERS_CAPTURED') {
     console.log('====== 捕获到私有接口请求头 ======');
@@ -76,30 +76,11 @@ window.addEventListener('message', (event) => {
     return;
   }
 
-  if (event.data.type === 'FETCH_RESPONSE') {
-    console.log('====== 拦截到API响应 ======');
-    console.log('URL:', event.data.url);
-    console.log('返回数据:', JSON.stringify(event.data.data, null, 2));
-    console.log('UnionId:', currentUnionId);
-    console.log('===========================');
-    
-    // 将结果发送到background script（成功获取到API返回）
-    try {
-      chrome.runtime.sendMessage({
-        action: 'tradeResult',
-        data: {
-          orderData: event.data.data,
-          unionId: currentUnionId,
-          bnResp: 1  // 系统返回
-        }
-      });
-      console.log('✅ 结果已发送到background script');
-    } catch (error) {
-      console.warn('⚠️ 发送到background失败（可能插件已重新加载）:', error.message);
-    }
-    
-    // 清空unionId
-    currentUnionId = null;
+  if (event.data.type === 'ALPHA_ORDER_ARMED' && activeTrade && event.data.unionId === activeTrade.id) {
+    activeTrade.armed = true;
+  }
+  if (event.data.type === 'FETCH_RESPONSE' && activeTrade && event.data.unionId === activeTrade.id) {
+    activeTrade.receipt = {unionId:activeTrade.id, orderData:event.data.data, bnResp:1};
   }
 });
 
@@ -109,11 +90,11 @@ window.addEventListener('message', (event) => {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'ping') {
     // 响应ping消息，表示content script已就绪
-    sendResponse({ success: true, ready: true });
+    sendResponse({ success: true, ready: true, protocol:2 });
     return true;
   } else if (request.action === 'executeTrade') {
     executeTradeOnPage(request.data)
-      .then(result => sendResponse({ success: true, result }))
+      .then(data => sendResponse({ protocol:2, data }))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true; // 保持消息通道打开
   }
@@ -124,109 +105,55 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
  * @param {Object} tradeInfo - 交易信息
  */
 async function executeTradeOnPage(tradeInfo) {
-  const { url, price, amount, direction, coin, unionId } = tradeInfo;
-  
-  console.log('开始执行交易:', tradeInfo);
-  
-  // 保存unionId
-  currentUnionId = unionId;
-  
+  const {url, price, amount, direction, coin, unionId, deadline:executionDeadline} = tradeInfo;
+  if (activeTrade) return AlphaTrade.failure(unionId, 'ORDER_STATUS_UNKNOWN', '页面已有未完成的订单，请核对订单');
+  const trade = {id:unionId, armed:false, receipt:null, clicked:false};
+  activeTrade = trade;
   try {
-    // 1. 检查页面URL是否匹配
-    if (window.location.href !== url) {
-      console.log('URL不匹配，等待页面跳转...');
-      // URL会由background script处理跳转
-      
-      // 发送错误结果
-      sendErrorResult('URL_MISMATCH', '页面URL不匹配，等待跳转', unionId);
-      return { status: 'url_mismatch', message: '等待页面跳转' };
-    }
-    
-    // 2. 等待页面完全加载
+    const checkAsset = () => {
+      if (!Number.isFinite(executionDeadline) || Date.now() >= executionDeadline) throw Error('订单执行期限已过，禁止继续点击');
+      if (AlphaTrade.assetKey(location.href) !== AlphaTrade.assetKey(url)) throw Error('页面币种与订单不符');
+    };
+    checkAsset();
     await waitForPageReady();
-    
-    // 3. 检查并点击"我知道了"按钮（如果存在）
     await clickKnowItButton();
-    
-    // 4. 点击买入或卖出标签（.bn-tab__buySell，页面上bn-tab-N有多组会重名）
     await clickTradeTab(direction);
-
-    // 4.5 确保是"限价"下单类型（#bn-tab-LIMIT），否则价格/数量输入框不生效
     await ensureLimitOrderTab();
-
-    // 5. 等待一下让UI更新
     await sleep(500);
-    
-    // 6. 设置价格
     await setInputValue('limitPrice', price);
-    
-    // 7. 设置数量
     await setInputValue('limitAmount', amount);
-    
-    // 8. 等待一下让值生效
     await sleep(300);
-    
-    // 9. 查找并点击提交按钮
-    await clickSubmitButton(direction, coin);
-    
-    // 10. 等待确认对话框出现
-    await sleep(500);
-    
-    // 11. 再次检查并点击"我知道了"按钮（如果存在）
-    await clickKnowItButton();
-    
-    // 12. 等待确认对话框：出现则点确认；6秒没有弹窗说明已直接提交，不报错（避免成功单被误报失败导致重复下单）
-    console.log('等待确认对话框（若有）...');
-    await clickDialogConfirmButton();
-
-    console.log('交易操作执行完成，等待API响应...');
-    return { status: 'success', message: '交易指令已提交' };
-    
-  } catch (error) {
-    console.error('执行交易失败:', error);
-    
-    // 发送错误结果
-    sendErrorResult('EXECUTION_ERROR', error.message, unionId);
-    
-    return { status: 'error', message: error.message };
-  }
-}
-
-/**
- * 发送错误结果到background script
- * @param {string} code - 错误代码
- * @param {string} message - 错误信息
- * @param {string} unionId - 关联ID
- */
-function sendErrorResult(code, message, unionId) {
-  try {
-    chrome.runtime.sendMessage({
-      action: 'tradeResult',
-      data: {
-        orderData: {
-          code: code,
-          message: message
-        },
-        unionId: unionId,
-        bnResp: 0  // 用户自己构建
-      }
-    });
-  } catch (error) {
-    console.warn('⚠️ 发送错误结果失败:', error.message);
+    checkAsset();
+    // Arm the interceptor and wait for acknowledgment before allowing a click.
+    window.postMessage({type:'ALPHA_ARM_ORDER', unionId}, '*');
+    const armDeadline = Date.now()+2000;
+    while (!trade.armed && Date.now()<armDeadline) await sleep(25);
+    if (!trade.armed) throw Error('订单回执拦截器未就绪，请刷新页面');
+    await clickSubmitButton(direction, coin, () => {checkAsset();trade.clicked=true;});
+    await sleep(100);
+    // A direct API response ends the dialog wait immediately.
+    await clickDialogConfirmButton(trade, checkAsset);
+    const deadline = Date.now()+30000;
+    while (!trade.receipt && Date.now()<deadline) await sleep(100);
+    if (!trade.receipt) throw Error('未收到币安下单回执，请核对订单');
+    return trade.receipt;
+  } catch (e) {
+    return trade.receipt || AlphaTrade.failure(unionId,trade.clicked ? 'ORDER_STATUS_UNKNOWN' : 'EXECUTION_ERROR',e.message);
+  } finally {
+    window.postMessage({type:'ALPHA_DISARM_ORDER',unionId}, '*');
+    activeTrade = null;
   }
 }
 
 /**
  * 等待页面准备就绪
  */
-function waitForPageReady() {
-  return new Promise((resolve) => {
-    if (document.readyState === 'complete') {
-      resolve();
-    } else {
-      window.addEventListener('load', resolve);
-    }
-  });
+async function waitForPageReady() {
+  const deadline = Date.now()+15000;
+  while (document.readyState !== 'complete') {
+    if (Date.now() >= deadline) throw Error('页面加载超时');
+    await sleep(100);
+  }
 }
 
 /**
@@ -304,13 +231,13 @@ async function setInputValue(inputId, value) {
  * @param {string} direction - 买卖方向 "Buy" 或 "Sell"
  * @param {string} coin - 币种
  */
-async function clickSubmitButton(direction, coin) {
+async function clickSubmitButton(direction, coin, beforeClick) {
   const buttonClass = direction === 'Buy' ? 'bn-button__buy' : 'bn-button__sell';
   const dirText = direction === 'Buy' ? '买入' : '卖出';
 
   // 查找所有包含指定class且未禁用的按钮
   const buttons = Array.from(document.querySelectorAll(`button[class*="${buttonClass}"]`))
-    .filter(b => !b.disabled);
+    .filter(b => !b.disabled && b.offsetParent !== null);
 
   console.log(`查找class="${buttonClass}"的可用按钮，找到${buttons.length}个`);
 
@@ -322,20 +249,11 @@ async function clickSubmitButton(direction, coin) {
     if (buttonText.includes(coin)) {
       console.log(`找到匹配的按钮，准备点击: "${buttonText}"`);
       await sleep(200);
+      beforeClick();
       button.click();
       console.log('按钮已点击');
       return;
     }
-  }
-
-  // 兜底：代币专属页通常只有一个买/卖按钮，币种文本没匹配上时直接点唯一可用按钮
-  const visible = buttons.filter(b => b.offsetParent !== null);
-  if (visible.length === 1) {
-    console.log(`未匹配到币种"${coin}"，使用唯一${dirText}按钮:`, (visible[0].textContent || '').trim());
-    await sleep(200);
-    visible[0].click();
-    console.log('按钮已点击（兜底）');
-    return;
   }
 
   throw new Error(`未找到包含币种"${coin}"的${dirText}按钮。候选按钮: ${texts.join(' | ') || '(无可用按钮)'}`);
@@ -371,27 +289,31 @@ async function clickKnowItButton() {
 
 /**
  * 等待并点击确认对话框中的按钮
- * Alpha 下单可能没有二次确认弹窗：6秒内没等到就按"已直接提交"处理，返回 false
+ * Alpha 下单可能没有二次确认弹窗；未发现弹窗仍须等待真实下单回执。
  * @returns {Promise<boolean>} 是否点到了确认按钮
  */
-async function clickDialogConfirmButton() {
+async function clickDialogConfirmButton(trade, checkAsset) {
   const deadline = Date.now() + 6000;
   const confirmKeywords = ['继续', '确认', '确定', '买入', '卖出'];
 
   while (Date.now() < deadline) {
+    if (trade.receipt) return false;
+    checkAsset();
     try {
       const dialogs = Array.from(document.querySelectorAll(
         '[role="dialog"], [class*="modal"], [class*="Modal"], [class*="dialog"], [class*="Dialog"]'
       )).filter(d => d.offsetParent !== null && d.offsetHeight > 0);
 
       for (const dlg of dialogs) {
-        const allBtns = Array.from(dlg.querySelectorAll('button')).filter(b => !b.disabled);
+        const allBtns = Array.from(dlg.querySelectorAll('button')).filter(b => !b.disabled && b.offsetParent !== null);
         // 优先点弹窗里的主按钮（币安确认钮常是"卖出 CT"这类带币种文案，精确匹配不可靠）
         const btn = allBtns.find(b => (b.className || '').includes('bn-button__primary'))
                  || allBtns.find(b => confirmKeywords.some(k => (b.textContent || '').includes(k)));
         if (btn) {
           console.log('找到确认对话框，点击:', (btn.textContent || '').trim(), '|', (btn.className || '').slice(0, 60));
           await sleep(200);
+          if (trade.receipt) return false;
+          checkAsset();
           btn.click();
           return true;
         }
@@ -400,7 +322,7 @@ async function clickDialogConfirmButton() {
     await sleep(300);
   }
 
-  console.log('6秒内未出现确认对话框，按已直接提交处理');
+  console.log('未出现确认对话框，继续等待真实API回执');
   return false;
 }
 

@@ -148,6 +148,13 @@
     <button class="secondary" id="refreshAssetsBtn">刷新持有资产</button>
     <div class="info" id="assetsInfo"></div>
     
+    <div class="input-group">
+      <label for="favoriteUrls">常用币种网址（每行一个，最多20个）</label>
+      <textarea id="favoriteUrls" rows="4" style="width:100%;box-sizing:border-box" placeholder="https://www.binance.com/zh-CN/alpha/bsc/合约地址"></textarea>
+      <button class="secondary" id="preloadBtn">保存并预打开币种页</button>
+      <div class="info" id="queueInfo"></div>
+      <button class="secondary" id="resumeQueueBtn" hidden>已核对币安订单，恢复接单</button>
+    </div>
     <div class="test-section">
       <h2>测试功能</h2>
       
@@ -185,7 +192,7 @@
     </div>
     
     <div class="info">
-      版本 1.0.0
+      版本 1.1.0
     </div>
   </div>
   
