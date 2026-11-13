@@ -4,6 +4,19 @@
  */
 
 let autoConnectTimer = null;
+let statusQueryVersion = 0;
+function refreshConnectionStatus() {
+  const version = ++statusQueryVersion;
+  chrome.runtime.sendMessage({action:'getConnectionStatus'}, response => {
+    const error = chrome.runtime.lastError;
+    if (version !== statusQueryVersion) return;
+    const element = document.getElementById('status');
+    if (!element) return;
+    element.textContent = error || !response || response.error
+      ? 'WebSocket: 状态读取失败' : response.message;
+    element.className = `status ${!error && response?.connected ? 'connected' : 'disconnected'}`;
+  });
+}
 
 document.addEventListener('DOMContentLoaded', () => {
   const connectBtn = document.getElementById('connectBtn');
@@ -11,6 +24,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const testBtn = document.getElementById('testBtn');
   const statusDiv = document.getElementById('status');
   const browserNumberInput = document.getElementById('browserNumber');
+  refreshConnectionStatus();
+  setInterval(refreshConnectionStatus, 2000);
   
   /**
    * 从存储中加载已保存的编号
@@ -33,10 +48,10 @@ document.addEventListener('DOMContentLoaded', () => {
       number
     }, (response) => {
       if (response && response.success) {
-        statusDiv.textContent = 'WebSocket: 正在连接...';
-        statusDiv.className = 'status';
+        refreshConnectionStatus();
         
       } else {
+        ++statusQueryVersion;
         statusDiv.textContent=response?.error || '连接失败';
         statusDiv.className='status disconnected';
       }
@@ -150,9 +165,7 @@ document.addEventListener('DOMContentLoaded', () => {
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'updateStatus') {
-    const statusDiv = document.getElementById('status');
-    statusDiv.textContent = request.message;
-    statusDiv.className = `status ${request.connected ? 'connected' : 'disconnected'}`;
+    refreshConnectionStatus();
   }
 });
 

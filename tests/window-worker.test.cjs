@@ -124,3 +124,17 @@ test('legacy URL-only config derives account without truncating malformed identi
   assert.equal(await f.ctx.currentBrowserName(),want);
  }
 });
+
+test('popup status follows actual socket lifecycle and ignores old socket events',{timeout:1000},async()=>{
+ const f=await boundFixture(),updates=[];f.ctx.chrome.runtime.sendMessage=async m=>updates.push(m);
+ await f.message({action:'connectWS',number:'23-1'});
+ assert.equal((await f.message({action:'getConnectionStatus'})).readyState,0);
+ const old=vm.runInContext('ws',f.ctx),oldOpen=old.onopen;
+ old.readyState=1;old.onopen();
+ assert.equal(updates.at(-1).connected,true);
+ assert.equal((await f.message({action:'getConnectionStatus'})).connected,true);
+ await f.message({action:'connectWS',number:'23-2'});const count=updates.length;oldOpen();assert.equal(updates.length,count);
+ const current=vm.runInContext('ws',f.ctx);current.readyState=3;current.onclose({code:1000});
+ assert.equal(updates.at(-1).connected,false);
+ assert.equal((await f.message({action:'getConnectionStatus'})).readyState,3);
+});

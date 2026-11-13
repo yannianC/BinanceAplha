@@ -299,6 +299,20 @@ try {
 /**
  * 连接WebSocket服务器
  */
+function getConnectionStatus() {
+  const readyState = ws ? ws.readyState : WebSocket.CLOSED;
+  const connected = readyState === WebSocket.OPEN;
+  const message = connected ? 'WebSocket: 已连接' :
+    readyState === WebSocket.CONNECTING ? 'WebSocket: 正在连接...' :
+    readyState === WebSocket.CLOSING ? 'WebSocket: 正在断开...' : 'WebSocket: 未连接';
+  return { readyState, connected, message };
+}
+
+function publishConnectionStatus() {
+  // A closed popup has no receiver; this must never interrupt socket handling.
+  chrome.runtime.sendMessage({ action: 'updateStatus', ...getConnectionStatus() }).catch(() => {});
+}
+
 function connectWebSocket() {
   try {
     // 清除旧的心跳定时器
@@ -320,9 +334,11 @@ function connectWebSocket() {
     // 用局部变量持有本次连接，事件触发时校验身份，陈旧连接的事件一律忽略
     const sock = new WebSocket(wsUrl);
     ws = sock;
+    publishConnectionStatus();
 
     sock.onopen = () => {
       if (sock !== ws) return;
+      publishConnectionStatus();
       console.log('WebSocket连接已建立');
       // 启动心跳机制
       startHeartbeat();
@@ -360,11 +376,13 @@ function connectWebSocket() {
 
     sock.onerror = (error) => {
       if (sock !== ws) return;
+      publishConnectionStatus();
       console.error('WebSocket错误:', error);
     };
 
     sock.onclose = (event) => {
       if (sock !== ws) return; // 陈旧连接关闭：不杀新连接心跳，也不安排重连
+      publishConnectionStatus();
       console.log('===== WebSocket连接已关闭 =====');
       console.log('关闭代码:', event.code);
       console.log('关闭原因:', event.reason || '无');
@@ -377,6 +395,7 @@ function connectWebSocket() {
       setTimeout(connectWebSocket, 5000);
     };
   } catch (error) {
+    publishConnectionStatus();
     console.error('连接WebSocket失败:', error);
     clearHeartbeat();
     setTimeout(connectWebSocket, 5000);
@@ -697,7 +716,7 @@ async function waitForTabLoaded(tabId) {
  * 监听来自content script的消息
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (['testTrade','resumeQueue','preloadTabs','bindWindow','openAlpha','connectWS','refreshAssetsTest'].includes(request.action) && sender.url !== chrome.runtime.getURL('popup.html')) { sendResponse({error:'仅插件弹窗可操作'}); return false; }
+  if (['getConnectionStatus','testTrade','resumeQueue','preloadTabs','bindWindow','openAlpha','connectWS','refreshAssetsTest'].includes(request.action) && sender.url !== chrome.runtime.getURL('popup.html')) { sendResponse({error:'仅插件弹窗可操作'}); return false; }
   if (request.action === 'authorizePage') {
     authorizeSender(sender,request.token).then(b=>sendResponse({authorized:true,token:b.token,instanceId:chrome.runtime.id})).catch(e=>sendResponse({authorized:false,error:e.message}));
     return true;
@@ -757,6 +776,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true; // 异步响应
   } else if (request.action === 'getTabId') {
     sendResponse({ tabId: tradingTabId });
+  } else if (request.action === 'getConnectionStatus') {
+    sendResponse(getConnectionStatus());
   } else if (request.action === 'connectWS') {
     (async()=>{
       if(isBusy()) throw Error('订单执行期间不能更换连接编号');
